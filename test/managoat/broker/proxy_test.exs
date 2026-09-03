@@ -521,6 +521,140 @@ defmodule Managoat.Broker.ProxyTest do
   end
 
   # ---------------------------------------------------------------------------
+  # A rule the host could not put a credential in
+
+  describe "a matched rule with no usable credential" do
+    setup ctx do
+      session = %{
+        attach_request_telemetry(ctx)
+        | rules: [%Rule{name: "unprovisioned", pattern: "localhost", scheme: :bearer}]
+      }
+
+      Memory.put(ctx.store, ctx.token, session)
+      %{session: session}
+    end
+
+    test "is 502 inside a tunnel, and the tunnel survives it", ctx do
+      # 502, not 403: the broker failed to obtain a credential, which is not
+      # the agent being told it may not go here. Before this the handler
+      # raised and the socket closed, so the agent saw a transport error and
+      # the audit log saw nothing at all.
+      #
+      # One rule of this session is unprovisioned and one is not, because
+      # the session is looked up once per connection: what the tunnel
+      # surviving means is that the *next* request on it is decided afresh,
+      # not that the store is read again.
+      Memory.put(ctx.store, ctx.token, %{
+        ctx.session
+        | rules: [
+            %Rule{name: "unprovisioned", pattern: "localhost/needs-a-token", scheme: :bearer},
+            %Rule{name: "provisioned", pattern: "localhost", scheme: :bearer, credential: "real"}
+          ]
+      })
+
+      tls = tunnel(ctx, ctx.token)
+
+      log =
+        capture_log(fn ->
+          :ok = :ssl.send(tls, "GET /needs-a-token HTTP/1.1\r\nHost: localhost\r\n\r\n")
+          reply = recv_until(tls, "\r\n\r\n")
+          assert reply =~ "HTTP/1.1 502"
+          refute reply =~ "connection: close"
+        end)
+
+      assert log =~ ~s(rule "unprovisioned")
+      assert log =~ ":bearer"
+
+      {head, echoed} = request(tls, "GET /now HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      assert head =~ "HTTP/1.1 200"
+      assert echoed["headers"]["authorization"] == "Bearer real"
+    end
+
+    test "emits one terminal event, with status 502 and a named error", ctx do
+      tls = tunnel(ctx, ctx.token)
+
+      capture_log(fn ->
+        :ok = :ssl.send(tls, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        recv_until(tls, "\r\n\r\n")
+      end)
+
+      assert_receive {:request, %{count: 1, duration: _},
+                      %{
+                        path: "/nope",
+                        status: 502,
+                        error: :credential_missing,
+                        outcome: :denied,
+                        rule: nil
+                      }}
+
+      refute_receive {:request, _, %{path: "/nope"}}, 200
+    end
+
+    test "closes the tunnel when the refused request left a body behind it", ctx do
+      # The proxy is not forwarding that body and will not read one it is
+      # refusing, so there is no way to find the next head in the stream.
+      tls = tunnel(ctx, ctx.token)
+
+      capture_log(fn ->
+        :ok =
+          :ssl.send(
+            tls,
+            "POST /with-body HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody"
+          )
+
+        {:ok, reply} = :ssl.recv(tls, 0, 5_000)
+        assert reply =~ "HTTP/1.1 502"
+        assert reply =~ "connection: close"
+      end)
+    end
+
+    test "is 502 over absolute-form plain HTTP too", ctx do
+      {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+      capture_log(fn ->
+        :ok =
+          :gen_tcp.send(
+            tcp,
+            "GET http://localhost:#{ctx.http_port}/plain HTTP/1.1\r\nHost: localhost\r\n" <>
+              "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
+          )
+
+        assert read_until_closed(tcp) =~ "HTTP/1.1 502"
+      end)
+
+      assert_receive {:request, _, %{path: "/plain", status: 502, error: :credential_missing}}
+    end
+
+    test "the refusal never names the credential, because there is none", ctx do
+      # The neighbouring case: a *wrong-shaped* credential is refused the
+      # same way, and the value the host did supply must not reach the log.
+      Memory.put(ctx.store, ctx.token, %{
+        ctx.session
+        | rules: [
+            %Rule{
+              name: "wrong-shape",
+              pattern: "localhost",
+              scheme: :basic,
+              credential: "not-a-pair-do-not-log"
+            }
+          ]
+      })
+
+      tls = tunnel(ctx, ctx.token)
+
+      log =
+        capture_log(fn ->
+          :ok = :ssl.send(tls, "GET /x HTTP/1.1\r\nHost: localhost\r\n\r\n")
+          {:ok, reply} = :ssl.recv(tls, 0, 5_000)
+          assert reply =~ "HTTP/1.1 502"
+        end)
+
+      assert log =~ ~s(rule "wrong-shape")
+      refute log =~ "not-a-pair-do-not-log"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # The request event is terminal: it knows how the request ended
 
   describe "the terminal request event" do

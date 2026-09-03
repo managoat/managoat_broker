@@ -37,6 +37,25 @@ defmodule Managoat.Broker.Injector do
   character or a space would split the request line in a `:target`, and CR
   or LF would end the field and start another in a `:header`. A space in a
   header value is ordinary and is not refused.
+
+  ## A credential the host could not supply
+
+  A matched `:bearer`, `:basic`, `:api_key` or `:custom` rule builds its
+  header *from* the credential, so a rule holding `nil` — or anything that
+  is not the shape the scheme needs — has no header to write. That is
+  refused, as `{:error, {:credential_missing, rule_name, scheme}}`, and
+  `Managoat.Broker.Proxy` answers `502`: the broker failed to obtain a
+  credential, which is not the client doing anything wrong, and an agent
+  should retry once it is provisioned rather than conclude it is not
+  allowed. It is the shape a `Store` hands back when provisioning is
+  incomplete, when decryption failed, or when an OAuth grant was never
+  connected.
+
+  The schemes that carry a placeholder rather than build a header are
+  deliberately not refused: a `:substitute` rule with no credential
+  forwards its placeholder as written, and a `:custom` template leaves a
+  `{{ KEY }}` it holds no value for alone. In both the origin refuses a
+  visible placeholder, which is the clearer failure.
   """
 
   alias Managoat.Broker.{Rule, Session}
@@ -50,8 +69,10 @@ defmodule Managoat.Broker.Injector do
   Rewrite `headers` and the request `target` for a request to
   `host`:`port`. Returns `{:ok, headers, target, rule_name}` with the
   target to forward and the name of the first matched rule (`nil` for
-  passthrough), `{:error, :denied}`, or `{:error, {:unsafe_credential,
-  rule_name}}` when a credential could not be written into the target.
+  passthrough), `{:error, :denied}`, `{:error, {:unsafe_credential,
+  rule_name, surface}}` when a credential could not be written into the
+  target, or `{:error, {:credential_missing, rule_name, scheme}}` when a
+  matched rule that sets a header holds no usable credential.
 
   `target` is the request target as the client sent it, origin-form
   (`/path?query`). Rules match against it unchanged; the returned target
@@ -63,6 +84,7 @@ defmodule Managoat.Broker.Injector do
           | {:error, :denied}
           | {:error, {:unsafe_credential, String.t() | nil, :target | :header}}
           | {:error, {:unusable_placeholder, String.t() | nil}}
+          | {:error, {:credential_missing, String.t() | nil, Rule.scheme()}}
   def inject(headers, host, port, target, %Session{} = session) do
     headers = Enum.reject(headers, fn {k, _} -> String.downcase(k) in @hop_by_hop end)
 
@@ -80,13 +102,16 @@ defmodule Managoat.Broker.Injector do
             headers = Enum.reduce(substitutions, headers, &substitute_headers/2)
             target = Enum.reduce(substitutions, target, &substitute_target/2)
 
-            headers =
-              case Enum.find(matched, &(&1.scheme not in [:substitute, :passthrough])) do
-                nil -> headers
-                rule -> put_auth(headers, rule)
-              end
+            case Enum.find(matched, &(&1.scheme not in [:substitute, :passthrough])) do
+              nil ->
+                {:ok, headers, target, first.name}
 
-            {:ok, headers, target, first.name}
+              rule ->
+                case put_auth(headers, rule) do
+                  {:ok, headers} -> {:ok, headers, target, first.name}
+                  :error -> {:error, {:credential_missing, rule.name, rule.scheme}}
+                end
+            end
 
           {rule, :placeholder} ->
             {:error, {:unusable_placeholder, rule.name}}
@@ -211,25 +236,41 @@ defmodule Managoat.Broker.Injector do
   end
 
   defp put_auth(headers, %Rule{scheme: :bearer, credential: token}) when is_binary(token) do
-    replace(headers, "authorization", "Bearer " <> token)
+    {:ok, replace(headers, "authorization", "Bearer " <> token)}
   end
 
   defp put_auth(headers, %Rule{scheme: :basic, credential: {user, pass}})
        when is_binary(user) and is_binary(pass) do
-    replace(headers, "authorization", "Basic " <> Base.encode64(user <> ":" <> pass))
+    {:ok, replace(headers, "authorization", "Basic " <> Base.encode64(user <> ":" <> pass))}
   end
 
   defp put_auth(headers, %Rule{scheme: :api_key, credential: value} = rule)
        when is_binary(value) do
-    replace(headers, rule.header || "Authorization", (rule.prefix || "") <> value)
+    {:ok, replace(headers, rule.header || "Authorization", (rule.prefix || "") <> value)}
   end
 
   defp put_auth(headers, %Rule{scheme: :custom, template: templates, credential: creds})
        when is_map(templates) and is_map(creds) do
-    Enum.reduce(templates, headers, fn {name, template}, acc ->
-      replace(acc, name, render(template, creds))
-    end)
+    {:ok,
+     Enum.reduce(templates, headers, fn {name, template}, acc ->
+       replace(acc, name, render(template, creds))
+     end)}
   end
+
+  # A matched rule whose credential is missing, or is not the shape its
+  # scheme builds a header from. The host resolved this rule at session
+  # creation and got nothing back: provisioning is incomplete, decryption
+  # failed, or an OAuth grant was never connected. There is no header to
+  # write, so the request is refused rather than sent without one — sending
+  # it unauthenticated would turn a broker failure into an origin's `401`,
+  # which reads as the agent's credential being wrong.
+  #
+  # `:substitute` is deliberately not here: a placeholder with no credential
+  # is forwarded as written, because the origin refusing a visible
+  # placeholder is the clearer failure. `:custom` leaves an unfilled
+  # `{{ KEY }}` alone for the same reason; it lands here only when it has no
+  # credential map at all.
+  defp put_auth(_headers, %Rule{}), do: :error
 
   # Every `{{ KEY }}` the rule holds a value for; one it does not is left
   # as written, which the origin then refuses, rather than sent empty.

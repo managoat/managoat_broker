@@ -55,6 +55,18 @@ defmodule Managoat.Broker.Rule do
 
   Several rules may match one request. The first matched rule that sets a
   header is the one that does; every matched `:substitute` rule applies.
+
+  A rule the host could not put a credential in — `credential` left `nil`,
+  or holding something other than the shape its scheme needs — has no
+  header to build, and every request it matches is refused with `502`
+  rather than sent without one. That is the shape a `Store` hands back when
+  provisioning is incomplete, when a credential could not be decrypted, or
+  when an OAuth grant was never connected, and `502` is what tells an agent
+  to retry once it is provisioned rather than that it is not allowed. The
+  two schemes that carry a placeholder instead of building a header are
+  deliberately exempt: a `:substitute` rule with no credential forwards its
+  placeholder as written, and a `:custom` template leaves a `{{ KEY }}` it
+  has no value for alone.
   """
 
   @type scheme :: :bearer | :basic | :api_key | :custom | :substitute | :passthrough

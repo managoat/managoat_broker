@@ -143,6 +143,102 @@ defmodule Managoat.Broker.InjectorTest do
     assert {:ok, ^headers, "missing"} = inject(headers, "api.example.com", "/", session)
   end
 
+  describe "a matched rule with no usable credential" do
+    # A `Store` that resolves credentials when it builds the session hands
+    # back a rule holding nil whenever provisioning is incomplete,
+    # decryption failed, or an OAuth grant was never connected. Agent Vault
+    # named the case `ErrCredentialMissing` and surfaced 502. Before this
+    # was handled, `put_auth/2` had no clause for it and the whole
+    # connection died on a `FunctionClauseError`.
+    defp with_rule(rule), do: %Session{rules: [rule], unmatched_host_policy: :passthrough}
+
+    test "a nil credential is refused, naming the rule and the scheme" do
+      for {scheme, extra} <- [
+            {:bearer, %{}},
+            {:basic, %{}},
+            {:api_key, %{header: "x-api-key"}},
+            {:custom, %{template: %{"Authorization" => "Token {{ K }}"}}}
+          ] do
+        rule =
+          struct(%Rule{name: "unprovisioned", pattern: "api.example.com", scheme: scheme}, extra)
+
+        assert {:error, {:credential_missing, "unprovisioned", ^scheme}} =
+                 inject(@headers, "api.example.com", "/", with_rule(rule)),
+               "#{scheme} with a nil credential was not refused"
+      end
+    end
+
+    test "a credential of the wrong shape is refused like a missing one" do
+      # There is nothing to build a header out of either way, and guessing
+      # would send the origin a credential the host never wrote.
+      wrong = [
+        %Rule{name: "b", pattern: "api.example.com", scheme: :bearer, credential: {"u", "p"}},
+        %Rule{name: "b", pattern: "api.example.com", scheme: :basic, credential: "flat"},
+        %Rule{name: "b", pattern: "api.example.com", scheme: :api_key, credential: 42},
+        %Rule{
+          name: "b",
+          pattern: "api.example.com",
+          scheme: :custom,
+          template: %{"Authorization" => "Token {{ K }}"},
+          credential: "not-a-map"
+        }
+      ]
+
+      for rule <- wrong do
+        assert {:error, {:credential_missing, "b", _}} =
+                 inject(@headers, "api.example.com", "/", with_rule(rule)),
+               "#{rule.scheme} with #{inspect(rule.credential)} was not refused"
+      end
+    end
+
+    test "the refusal names no credential, because there is none to name" do
+      # The pair that is deliberately *not* refused, from #15 and from the
+      # `:custom` renderer: a placeholder the origin can see is a clearer
+      # failure than a header the broker could not build.
+      substitute = %Rule{
+        name: "sub",
+        pattern: "api.example.com",
+        scheme: :substitute,
+        placeholder: "__api_token__"
+      }
+
+      assert {:ok, _, "sub"} = inject(@headers, "api.example.com", "/", with_rule(substitute))
+
+      partial = %Rule{
+        name: "half",
+        pattern: "api.example.com",
+        scheme: :custom,
+        template: %{"Authorization" => "Token {{ HAVE }}", "X-Missing" => "{{ HAVE_NOT }}"},
+        credential: %{"HAVE" => "yes"}
+      }
+
+      assert {:ok, out, "half"} = inject(@headers, "api.example.com", "/", with_rule(partial))
+      assert {"Authorization", "Token yes"} in out
+      assert {"X-Missing", "{{ HAVE_NOT }}"} in out
+    end
+
+    test "a substitute rule beside it still applies before the refusal is decided" do
+      # The substitution and the header are separate jobs; only the second
+      # one failed. What matters is that the request is refused rather than
+      # forwarded half-injected.
+      session = %Session{
+        rules: [
+          %Rule{
+            name: "sub",
+            pattern: "api.example.com",
+            scheme: :substitute,
+            placeholder: "__oauth__",
+            credential: "oauth-real"
+          },
+          %Rule{name: "key", pattern: "api.example.com", scheme: :api_key}
+        ]
+      }
+
+      assert {:error, {:credential_missing, "key", :api_key}} =
+               inject([{"Authorization", "Bearer __oauth__"}], "api.example.com", "/", session)
+    end
+  end
+
   test "a substitute rule whose placeholder is not usable as one is refused" do
     # This used to pass through silently, which is the failure mode the
     # check exists for: a rule that cannot do its job doing nothing.

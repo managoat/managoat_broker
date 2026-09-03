@@ -44,6 +44,14 @@ defmodule Managoat.Broker.Proxy do
   complete; a response whose head arrived and whose body then failed
   carries both. So a long-lived stream is not recorded until it ends.
 
+  A refusal is a `403` — the session may not reach this host, or a
+  credential could not be written where its placeholder sat — except for a
+  matched rule whose credential the host never supplied, which is a `502`
+  with `error: :credential_missing`: the broker failed to obtain a
+  credential rather than deciding anything, and an agent should retry once
+  it is provisioned. Inside a tunnel that `502` refuses the request without
+  ending the tunnel, where the refused request left no body behind it.
+
   Beside it, every connection the proxy decides about emits `[:managoat,
   :broker, :connect]` with `%{count: 1}` and the metadata `host`, `port`,
   `outcome` (`:ok`, `:upstream_failed`, `:denied` or `:unauthenticated`)
@@ -595,10 +603,38 @@ defmodule Managoat.Broker.Proxy do
 
       {:error, reason} ->
         refuse_request(conn.session, head, conn.host, reason)
-        reply(conn.client, 403, "Forbidden", [{"connection", "close"}])
-        :client_closed
+        refuse_in_tunnel(conn, rest, framing, reason)
     end
   end
+
+  # A refusal written into an open tunnel. A `502` for a credential the
+  # broker could not obtain is about this request and not this connection —
+  # the next request on the tunnel may match a rule that is provisioned — so
+  # the tunnel survives it, as long as the refused request left nothing
+  # behind it in the stream. A request with a body did: the proxy is not
+  # forwarding that body and will not read one it is refusing, so the
+  # framing would be lost and the next head would be read out of the middle
+  # of it.
+  #
+  # A denial is the other thing. `403` says this session may not reach here,
+  # which the next request would only hear again, so it closes as before.
+  defp refuse_in_tunnel(conn, rest, framing, reason) do
+    status = refusal_status(reason)
+
+    if status == 502 and bodyless?(framing) do
+      reply(conn.client, 502, "Bad Gateway")
+      serve(conn, rest)
+    else
+      reply(conn.client, status, status_reason(status), [{"connection", "close"}])
+      :client_closed
+    end
+  end
+
+  # Did this request leave anything after its head for the next read to trip
+  # over? A declared length of zero is a body, and is no bytes.
+  defp bodyless?(:none), do: true
+  defp bodyless?({:length, 0}), do: true
+  defp bodyless?(_framing), do: false
 
   # A body whose length the client declared, compared with the cap before
   # anything is forwarded. A chunked body declares nothing, so it is
@@ -743,7 +779,8 @@ defmodule Managoat.Broker.Proxy do
 
       {:error, reason} ->
         refuse_request(session, head, host, reason)
-        reply(socket, 403, "Forbidden")
+        status = refusal_status(reason)
+        reply(socket, status, status_reason(status))
         {:error, :denied}
     end
   end
@@ -927,17 +964,36 @@ defmodule Managoat.Broker.Proxy do
             "its credential holds a character that would break the request"
         )
 
+      {:credential_missing, rule, scheme} ->
+        Logger.warning(
+          "broker: rule #{inspect(rule)} (#{inspect(scheme)}) has no usable credential, " <>
+            "so the request was refused with 502 rather than sent without one. The session " <>
+            "was built with the credential missing, undecryptable, or not yet granted."
+        )
+
       _ ->
         :ok
     end
 
     session
     |> pending_request(head, host, {:error, :denied})
-    |> emit(refusal_status(reason), nil)
+    |> emit(refusal_status(reason), refusal_error(reason))
   end
 
+  # What the event's `error` names. A policy refusal has nothing to add —
+  # `outcome: :denied` with the status is the whole story — but a `502` is
+  # the broker failing rather than deciding, and a host reading its request
+  # log has to be able to tell the two apart without parsing a message.
+  defp refusal_error({:credential_missing, _rule, _scheme}), do: :credential_missing
+  defp refusal_error(_reason), do: nil
+
   defp refusal_status(:request_too_large), do: 413
+  defp refusal_status({:credential_missing, _rule, _scheme}), do: 502
   defp refusal_status(_reason), do: 403
+
+  defp status_reason(403), do: "Forbidden"
+  defp status_reason(413), do: "Content Too Large"
+  defp status_reason(502), do: "Bad Gateway"
 
   defp emit_finished({request, status, error}), do: emit(request, status, error)
 
