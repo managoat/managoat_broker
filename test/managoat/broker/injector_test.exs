@@ -116,6 +116,24 @@ defmodule Managoat.Broker.InjectorTest do
     assert {"X-Other", "untouched"} in out
   end
 
+  test "an incomplete substitute rule leaves headers unchanged" do
+    headers = [{"Authorization", "Bearer placeholder"}]
+
+    for rule <- [
+          %Rule{name: "empty", pattern: "api.example.com", scheme: :substitute, placeholder: ""},
+          %Rule{
+            name: "missing",
+            pattern: "api.example.com",
+            scheme: :substitute,
+            placeholder: "placeholder"
+          }
+        ] do
+      session = %Session{rules: [rule]}
+      assert {:ok, ^headers, rule_name} = inject(headers, "api.example.com", "/", session)
+      assert rule_name == rule.name
+    end
+  end
+
   test "a substitute rule and a header rule on one host both apply; the first names the outcome" do
     session = %Session{
       rules: [

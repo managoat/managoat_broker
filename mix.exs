@@ -1,7 +1,7 @@
 defmodule Managoat.Broker.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.1.1"
   @source_url "https://github.com/managoat/managoat_broker"
 
   def project do
@@ -23,7 +23,7 @@ defmodule Managoat.Broker.MixProject do
         # real Bandit HTTPS origin, the CA, the injector, the HTTP slice and
         # the in-memory store. Raise it as the library's own tests grow;
         # never lower it.
-        summary: [threshold: 85]
+        summary: [threshold: 97]
       ]
     ]
   end

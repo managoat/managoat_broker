@@ -122,6 +122,66 @@ defmodule Managoat.Broker.ProxyTest do
     assert reply =~ "HTTP/1.1 400"
   end
 
+  test "an abandoned connection does not affect the listener", ctx do
+    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+    :ok = :gen_tcp.close(tcp)
+
+    {_tcp, reply} = connect(ctx, "localhost:#{ctx.https_port}", proxy_auth(ctx.token))
+    assert reply =~ "HTTP/1.1 200"
+  end
+
+  test "garbage inside an established tunnel is 400 and closes that tunnel", ctx do
+    tls = tunnel(ctx, ctx.token)
+    :ok = :ssl.send(tls, "not an HTTP request\r\n\r\n")
+    {:ok, reply} = :ssl.recv(tls, 0, 5_000)
+    assert reply =~ "HTTP/1.1 400"
+  end
+
+  test "an unreachable plain HTTP origin is 502", ctx do
+    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+    :ok =
+      :gen_tcp.send(
+        tcp,
+        "GET http://localhost:1/ HTTP/1.1\r\nHost: localhost\r\n" <>
+          "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
+      )
+
+    assert read_until_closed(tcp) =~ "HTTP/1.1 502"
+  end
+
+  test "closing a partial plain HTTP body does not affect later connections", ctx do
+    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+    :ok =
+      :gen_tcp.send(
+        tcp,
+        "POST http://localhost:#{ctx.http_port}/body HTTP/1.1\r\nHost: localhost\r\n" <>
+          "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\nContent-Length: 10\r\n\r\nshort"
+      )
+
+    :ok = :gen_tcp.close(tcp)
+
+    {_tcp, reply} = connect(ctx, "localhost:#{ctx.https_port}", proxy_auth(ctx.token))
+    assert reply =~ "HTTP/1.1 200"
+  end
+
+  test "closing a partial tunneled body does not affect later connections", ctx do
+    tls = tunnel(ctx, ctx.token)
+
+    :ok =
+      :ssl.send(
+        tls,
+        "POST /body HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\r\nshort"
+      )
+
+    :ok = :ssl.close(tls)
+
+    tls = tunnel(ctx, ctx.token)
+    {_, echoed} = request(tls, "GET /after-close HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert echoed["path"] == "/after-close"
+  end
+
   test "an origin on a private or loopback address is refused before any connection" do
     ctx = start_rig(allow_private_upstreams: false)
     token = put_session(ctx, bearer_session("x"))
