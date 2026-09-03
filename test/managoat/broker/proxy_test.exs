@@ -4,6 +4,8 @@ defmodule Managoat.Broker.ProxyTest do
   # credential where the client sent a placeholder.
   use Managoat.Broker.ProxyCase, async: true
 
+  import ExUnit.CaptureLog
+
   alias Managoat.Broker.Proxy
 
   setup do
@@ -328,5 +330,133 @@ defmodule Managoat.Broker.ProxyTest do
     :ok = :ssl.send(tls, "GET /no HTTP/1.1\r\nHost: localhost\r\n\r\n")
     {:ok, _} = :ssl.recv(tls, 0, 5_000)
     assert_receive {:request, _, %{path: "/no", outcome: :denied, rule: nil}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # The 407 is an invitation to retry, not a dead end
+
+  test "a 407 holds the connection open, so a client that negotiates can retry on it", ctx do
+    # git's default, `http.proxyAuthMethod=anyauth`: CONNECT bare *in order
+    # to* learn the scheme from the challenge, then retry with the
+    # credential on the same socket. Closing after the 407 broke every
+    # brokered clone in production.
+    host_port = "localhost:#{ctx.https_port}"
+    {tcp, challenge} = connect(ctx, host_port, nil)
+
+    assert challenge =~ "HTTP/1.1 407"
+    assert challenge =~ ~r/proxy-authenticate: Basic/i
+    assert challenge =~ ~r/proxy-connection: Keep-Alive/i
+
+    assert :ok = retry(tcp, host_port, proxy_auth(ctx.token))
+    assert {:ok, reply} = :gen_tcp.recv(tcp, 0, 5_000)
+    assert reply =~ "HTTP/1.1 200"
+  end
+
+  test "the retry is bounded: a client that never authenticates is dropped", ctx do
+    host_port = "localhost:#{ctx.https_port}"
+    {tcp, first} = connect(ctx, host_port, nil)
+    assert first =~ ~r/proxy-connection: Keep-Alive/i
+
+    :ok = retry(tcp, host_port, nil)
+    {:ok, second} = :gen_tcp.recv(tcp, 0, 5_000)
+    assert second =~ "HTTP/1.1 407"
+    assert second =~ ~r/proxy-connection: Keep-Alive/i
+
+    # The last attempt is answered without the invitation, and closed.
+    :ok = retry(tcp, host_port, nil)
+    {:ok, third} = :gen_tcp.recv(tcp, 0, 5_000)
+    assert third =~ "HTTP/1.1 407"
+    refute third =~ ~r/proxy-connection/i
+
+    assert {:error, :closed} = :gen_tcp.recv(tcp, 0, 5_000)
+  end
+
+  test "an unauthenticated request carrying a body is answered and closed", ctx do
+    # Holding this one open would leave the body in the stream with nothing
+    # to consume it, and the next parse would read it as a request head.
+    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false], 5_000)
+
+    :ok =
+      :gen_tcp.send(
+        tcp,
+        "POST http://localhost:#{ctx.http_port}/x HTTP/1.1\r\nHost: localhost\r\n" <>
+          "Content-Length: 5\r\n\r\nhello"
+      )
+
+    {:ok, reply} = :gen_tcp.recv(tcp, 0, 5_000)
+    assert reply =~ "HTTP/1.1 407"
+    refute reply =~ ~r/proxy-connection/i
+    assert {:error, :closed} = :gen_tcp.recv(tcp, 0, 5_000)
+  end
+
+  test "a credential-less request logs at debug; a bad token still logs at info", ctx do
+    # The blackbox liveness probe is a credential-less request every thirty
+    # seconds. At `:info` it wrote ~2,880 lines a day and buried the real
+    # refusals among them.
+    no_credentials =
+      capture_log(fn ->
+        {_tcp, _} = connect(ctx, "localhost:#{ctx.https_port}", nil)
+      end)
+
+    refute no_credentials =~ "refused connection"
+
+    bad_token =
+      capture_log(fn ->
+        {_tcp, _} = connect(ctx, "localhost:#{ctx.https_port}", proxy_auth("mb_nope"))
+      end)
+
+    assert bad_token =~ "refused connection: :unknown_token"
+  end
+
+  # ---------------------------------------------------------------------------
+  # The connect event: one per connection, whatever the proxy decided
+
+  test "every connection emits a connect event, so a failure ratio has a denominator", ctx do
+    handler = "connect-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:managoat, :broker, :connect],
+      fn _e, measurements, meta, pid -> send(pid, {:connect, measurements, meta}) end,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    {_tcp, _} = connect(ctx, "localhost:#{ctx.https_port}", proxy_auth(ctx.token))
+
+    assert_receive {:connect, %{count: 1},
+                    %{
+                      host: "localhost",
+                      port: port,
+                      outcome: :ok,
+                      meta: %{conversation_id: "conv-1", user_id: "user-1"}
+                    }}
+
+    assert port == ctx.https_port
+
+    # An origin that will not connect.
+    {_tcp, _} = connect(ctx, "localhost:1", proxy_auth(ctx.token))
+    assert_receive {:connect, _, %{host: "localhost", port: 1, outcome: :upstream_failed}}
+
+    # A host outside a `deny` session's rules.
+    Memory.put(ctx.store, ctx.token, %{
+      ctx.session
+      | rules: [%Rule{name: "x", pattern: "api.example.com", scheme: :passthrough}],
+        unmatched_host_policy: :deny
+    })
+
+    {_tcp, _} = connect(ctx, "localhost:#{ctx.https_port}", proxy_auth(ctx.token))
+    assert_receive {:connect, _, %{host: "localhost", outcome: :denied}}
+
+    # No credential: no session, so no destination has been read yet.
+    {_tcp, _} = connect(ctx, "localhost:#{ctx.https_port}", nil)
+    assert_receive {:connect, _, %{host: nil, port: nil, outcome: :unauthenticated, meta: %{}}}
+  end
+
+  # A second request head down a socket the proxy answered with a 407.
+  defp retry(tcp, host_port, auth) do
+    line = if auth, do: "Proxy-Authorization: #{auth}\r\n", else: ""
+    :gen_tcp.send(tcp, "CONNECT #{host_port} HTTP/1.1\r\nHost: #{host_port}\r\n#{line}\r\n")
   end
 end

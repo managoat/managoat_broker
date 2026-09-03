@@ -25,6 +25,15 @@ defmodule Managoat.Broker.Proxy do
   rule's name or nil) and `meta` (the session's, unchanged). Never a header,
   never a body. The host attaches a handler and writes its log line.
 
+  Beside it, every connection the proxy decides about emits `[:managoat,
+  :broker, :connect]` with `%{count: 1}` and the metadata `host`, `port`,
+  `outcome` (`:ok`, `:upstream_failed`, `:denied` or `:unauthenticated`)
+  and `meta`. That event is emitted on every path, the ones that never
+  reach an origin included, so "how much of this broker's egress is
+  failing" is a ratio over it rather than a count with no denominator. On
+  `:unauthenticated` there is no session and no destination yet, so `host`
+  and `port` are nil and `meta` is empty.
+
   This module is a `ThousandIsland.Handler`; ThousandIsland calls its
   `child_spec/1` for every accepted connection, which is why the listener's
   own child spec lives on `Managoat.Broker` and not here.
@@ -41,6 +50,12 @@ defmodule Managoat.Broker.Proxy do
   @idle_timeout 300_000
   @connect_timeout 10_000
 
+  # How many times one connection may be answered with a `407` before the
+  # proxy stops reading from it. Two is enough for the negotiation this
+  # exists for (bare request, then the credentialed retry); the third is
+  # slack for a client that re-negotiates once.
+  @auth_attempts 3
+
   # ---------------------------------------------------------------------------
   # One client connection
 
@@ -53,8 +68,15 @@ defmodule Managoat.Broker.Proxy do
       upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, [])
     }
 
-    with {:ok, head, rest} <- read_head(socket, "", @head_timeout),
-         {:ok, session} <- authenticate(socket, head, state),
+    serve_client(socket, "", state, @auth_attempts)
+  end
+
+  # One request head off this connection, and what the proxy does about it.
+  # Recurses only on `{:retry, _}`, which is a client coming back with a
+  # credential after a `407`; every other outcome ends the connection.
+  defp serve_client(socket, buffer, state, attempts) do
+    with {:ok, head, rest} <- read_head(socket, buffer, @head_timeout),
+         {:ok, session} <- authenticate(socket, head, rest, attempts, state),
          {:ok, {host, port}, target} <- destination(socket, head) do
       case head.method do
         "CONNECT" ->
@@ -62,6 +84,7 @@ defmodule Managoat.Broker.Proxy do
             tunnel(socket, host, port, session, state)
           else
             log_request(session, head, host, {:error, :denied})
+            connect_event(session, host, port, :denied)
             reply(socket, 403, "Forbidden")
             {:close, state}
           end
@@ -70,6 +93,7 @@ defmodule Managoat.Broker.Proxy do
           forward_plain(socket, head, rest, host, port, target, session, state)
       end
     else
+      {:retry, rest} -> serve_client(socket, rest, state, attempts - 1)
       {:error, _} -> {:close, state}
     end
   end
@@ -100,21 +124,57 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
-  defp authenticate(socket, head, state) do
+  defp authenticate(socket, head, rest, attempts, state) do
     with {:ok, token} <- proxy_token(head.headers),
          {:ok, %Session{} = session} <- lookup(state.store, token),
          false <- Session.expired?(session, DateTime.utc_now()) do
       {:ok, session}
     else
       reason ->
-        Logger.info("broker: refused connection: #{inspect(refusal(reason))}")
-
-        reply(socket, 407, "Proxy Authentication Required", [
-          {"proxy-authenticate", ~s(Basic realm="managoat-broker")}
-        ])
-
-        {:error, :unauthenticated}
+        log_refusal(refusal(reason))
+        connect_event(nil, nil, nil, :unauthenticated)
+        challenge(socket, head, rest, attempts)
     end
+  end
+
+  # A request with no `Proxy-Authorization` is the first half of a
+  # negotiation, not an incident: it is what a client that asks the proxy
+  # which scheme to use sends, and it is what a credential-less liveness
+  # probe sends every thirty seconds. A token that is wrong or expired is
+  # the other thing entirely, and stays at `:info` where it can be seen.
+  defp log_refusal(:no_credentials),
+    do: Logger.debug("broker: no credentials, challenging")
+
+  defp log_refusal(reason),
+    do: Logger.info("broker: refused connection: #{inspect(reason)}")
+
+  # The `407` itself. RFC 9110 makes the challenge an invitation to retry,
+  # so the connection stays open for that retry: a client on
+  # `http.proxyAuthMethod=anyauth` — git's default — sent its first request
+  # bare *in order to* learn the scheme, and retries on the same socket. A
+  # proxy that closes here turns the challenge into a dead end, and inside a
+  # sandbox that presents as "the network is broken".
+  #
+  # Held open only when the bytes after the head are the next request: a
+  # request carrying a body would leave that body in the stream with nothing
+  # to consume it, and reading a body the proxy is refusing to forward is
+  # work an unauthenticated client should not be able to ask for. `CONNECT`,
+  # the case this exists for, never has one. `@auth_attempts` bounds the
+  # rest, so a client that never authenticates cannot hold the socket past
+  # a few head timeouts.
+  defp challenge(socket, head, rest, attempts) do
+    hold? = attempts > 1 and HTTP.body_framing(head) == :none
+
+    keep_alive = if hold?, do: [{"proxy-connection", "Keep-Alive"}], else: []
+
+    reply(
+      socket,
+      407,
+      "Proxy Authentication Required",
+      [{"proxy-authenticate", ~s(Basic realm="managoat-broker")}] ++ keep_alive
+    )
+
+    if hold?, do: {:retry, rest}, else: {:error, :unauthenticated}
   end
 
   defp refusal({:error, reason}), do: reason
@@ -156,6 +216,7 @@ defmodule Managoat.Broker.Proxy do
     with {:ok, address} <- resolve(socket, host, port, state),
          {:ok, upstream} <- connect_tls(socket, address, host, port, state) do
       Socket.send(socket, "HTTP/1.1 200 Connection established\r\n\r\n")
+      connect_event(session, host, port, :ok)
 
       # The handshake runs on the raw socket: the handler is synchronous
       # from here to the end of the tunnel, so the transport switch stays
@@ -177,7 +238,13 @@ defmodule Managoat.Broker.Proxy do
           {:close, state}
       end
     else
-      {:error, _} -> {:close, state}
+      {:error, :private_upstream} ->
+        connect_event(session, host, port, :denied)
+        {:close, state}
+
+      {:error, _} ->
+        connect_event(session, host, port, :upstream_failed)
+        {:close, state}
     end
   end
 
@@ -333,6 +400,7 @@ defmodule Managoat.Broker.Proxy do
          {:ok, address} <- resolve(socket, host, port, state),
          {:ok, upstream} <- connect_plain(socket, address, host, port) do
       log_request(session, head, host, {:ok, rule})
+      connect_event(session, host, port, :ok)
 
       headers = [
         {"connection", "close"}
@@ -349,7 +417,13 @@ defmodule Managoat.Broker.Proxy do
       :gen_tcp.close(upstream)
       {:close, state}
     else
-      {:error, _} -> {:close, state}
+      {:error, reason} when reason in [:denied, :private_upstream] ->
+        connect_event(session, host, port, :denied)
+        {:close, state}
+
+      {:error, _} ->
+        connect_event(session, host, port, :upstream_failed)
+        {:close, state}
     end
   end
 
@@ -461,6 +535,25 @@ defmodule Managoat.Broker.Proxy do
       meta: meta
     })
   end
+
+  # One event per connection the proxy decides about, whatever it decided,
+  # so a failure ratio has a denominator. `:ok` is an origin reached and the
+  # client told so; `:upstream_failed` is the `502` path (a name that does
+  # not resolve, an origin that will not connect); `:denied` is the `403`
+  # path (a host outside a `deny` session's rules, or one that resolves into
+  # the operator's own network); `:unauthenticated` is the `407`, where
+  # there is no session yet and so no host to name.
+  defp connect_event(session, host, port, outcome) do
+    :telemetry.execute([:managoat, :broker, :connect], %{count: 1}, %{
+      host: host,
+      port: port,
+      outcome: outcome,
+      meta: session_meta(session)
+    })
+  end
+
+  defp session_meta(%Session{meta: meta}), do: meta
+  defp session_meta(nil), do: %{}
 
   defp path_only("http://" <> _ = target), do: URI.parse(target).path || "/"
   defp path_only(target), do: target
