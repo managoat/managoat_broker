@@ -47,6 +47,27 @@ defmodule Managoat.Broker.IPv6Test do
       end
     end
 
+    test "both families are asked, IPv4 first, and a family that does not answer is not an error" do
+      # The union `resolve/4` vets. Order is the part worth pinning: if the
+      # two lookups were transposed the union would be identical and only
+      # the dial preference would change, silently.
+      localhost = Proxy.addresses("localhost")
+
+      assert {127, 0, 0, 1} in localhost
+      v4_last = Enum.find_index(localhost, &(tuple_size(&1) == 4))
+      v6_first = Enum.find_index(localhost, &(tuple_size(&1) == 8))
+
+      if v6_first, do: assert(v4_last < v6_first, "IPv6 came before IPv4: #{inspect(localhost)}")
+
+      # A literal resolves in its own family and fails in the other, which
+      # is the arm that must not turn a working host into a 502.
+      assert Proxy.addresses("127.0.0.1") == [{127, 0, 0, 1}]
+      assert {:error, :nxdomain} = :inet.getaddrs(~c"127.0.0.1", :inet6)
+
+      # Only the empty union is a failure to resolve.
+      assert Proxy.addresses("no-such-host.invalid") == []
+    end
+
     test "one blocked answer refuses the host, whatever the others are" do
       # The rule the ordering of a resolver's answers must not decide.
       public = {2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888}

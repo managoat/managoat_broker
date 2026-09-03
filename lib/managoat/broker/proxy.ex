@@ -338,6 +338,7 @@ defmodule Managoat.Broker.Proxy do
 
   @doc """
   Which of `addresses` the proxy must not dial on a sandbox's behalf.
+  Pairs with `addresses/1`.
 
   Empty means the host may be reached. A non-empty result is a refusal of
   the *host*, whichever address was about to be dialed: checking only the
@@ -349,9 +350,21 @@ defmodule Managoat.Broker.Proxy do
   @spec blocked([:inet.ip_address()]) :: [:inet.ip_address()]
   def blocked(addresses), do: Enum.filter(addresses, &private?/1)
 
-  # A and AAAA. A family that does not answer is not an error — most hosts
-  # have only one — so only the empty union is a failure to resolve.
-  defp addresses(host) do
+  @doc """
+  Every address `host` resolves to, in the order the proxy would dial
+  them, or `[]` when it does not resolve.
+
+  A and AAAA are both asked for. A family that does not answer is not an
+  error — most hosts have only one — so only the empty union means the
+  name failed. IPv4 comes first: every host that resolved before this
+  proxy spoke IPv6 still takes the address it took then, and IPv6 is a
+  path for hosts that previously had none.
+
+  The pair with `blocked/1` is the whole guard: `blocked(addresses(host))`
+  empty means the host may be dialed.
+  """
+  @spec addresses(String.t()) :: [:inet.ip_address()]
+  def addresses(host) do
     name = String.to_charlist(host)
 
     Enum.uniq(family_addresses(name, :inet) ++ family_addresses(name, :inet6))
