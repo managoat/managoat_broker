@@ -232,6 +232,37 @@ defmodule Managoat.Broker.IPv6Test do
       assert recv_until(client, "\"path\"") =~ "/tunnelled"
     end
 
+    test "an origin whose certificate names a different address is refused" do
+      # The regression this exists for: `server_name_indication: :disable`
+      # would make an origin named by address verify against nothing at
+      # all, so a certificate for any address would be accepted. Every
+      # functional test still passes with that bug, because the leaf the
+      # rig hands out happens to be the right one. This one does not.
+      wrong = <<0x20, 0x01, 0x0D, 0xB8, 0::88, 1>>
+      {ca, tls} = origin_tls_for_address(wrong)
+
+      ctx = start_rig(extra_cacerts: [X509.Certificate.to_der(ca)])
+      port = start_https_origin_v6(tls)
+      token = put_session(ctx, bearer_session("x"))
+
+      # The CA is trusted; the identity is not the one dialed. A 502 means
+      # the proxy checked. A 200 means it did not.
+      {_tcp, reply} = connect(ctx, "[::1]:#{port}", proxy_auth(token))
+      assert reply =~ "HTTP/1.1 502", "upstream identity was not verified: #{inspect(reply)}"
+    end
+
+    test "an origin whose certificate names the address dialed is accepted" do
+      # The other half: verification is on, not merely failing everything.
+      {ca, tls} = origin_tls_for_address(<<0::120, 1>>)
+
+      ctx = start_rig(extra_cacerts: [X509.Certificate.to_der(ca)])
+      port = start_https_origin_v6(tls)
+      token = put_session(ctx, bearer_session("x"))
+
+      {_tcp, reply} = connect(ctx, "[::1]:#{port}", proxy_auth(token))
+      assert reply =~ "HTTP/1.1 200"
+    end
+
     test "an IPv6 loopback upstream is refused when the guard is on" do
       ctx = start_rig(allow_private_upstreams: false)
       port = start_http_origin_v6()

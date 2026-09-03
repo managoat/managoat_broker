@@ -69,9 +69,13 @@ that worked before behaves differently.
   worked before takes the address it took before, and IPv6 is a path for
   hosts that previously had none.
 
-- An origin named by address gets no SNI (RFC 6066 has no name to put
-  there and forbids sending one); its certificate is matched against the
-  address instead.
+- An origin named by address gets no SNI: RFC 6066 has no name to put
+  there and forbids sending one, so the option is **omitted** rather than
+  set to `:disable`. `:disable` would have been the obvious spelling and is
+  a hostname-verification bypass — `:ssl` then checks nothing, and accepts
+  a certificate naming any address at all. Omitted, `:ssl` falls back to
+  the connect call's own `Host` argument, which is the vetted address, and
+  matches the certificate's `iPAddress` SAN against it.
 
 ### Notes
 

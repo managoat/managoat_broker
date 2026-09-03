@@ -130,6 +130,26 @@ defmodule Managoat.Broker.ProxyCase do
     {ca, [cert: X509.Certificate.to_der(cert), key: {:ECPrivateKey, X509.PrivateKey.to_der(key)}]}
   end
 
+  @doc """
+  A CA and a leaf naming one IP address and nothing else, as Bandit's
+  `transport_options`. For testing that upstream verification actually
+  checks the address it connected to.
+  """
+  def origin_tls_for_address(octets) do
+    ca_key = X509.PrivateKey.new_ec(:secp256r1)
+    ca = X509.Certificate.self_signed(ca_key, "/CN=Address CA", template: :root_ca)
+    key = X509.PrivateKey.new_ec(:secp256r1)
+
+    sans = X509.Certificate.Extension.subject_alt_name(iPAddress: :binary.bin_to_list(octets))
+
+    cert =
+      key
+      |> X509.PublicKey.derive()
+      |> X509.Certificate.new("/CN=address", ca, ca_key, extensions: [subject_alt_name: sans])
+
+    {ca, [cert: X509.Certificate.to_der(cert), key: {:ECPrivateKey, X509.PrivateKey.to_der(key)}]}
+  end
+
   @doc "Start an HTTPS origin on [::1]:0 with `tls`; returns its port."
   def start_https_origin_v6(tls) do
     pid =
@@ -237,7 +257,9 @@ defmodule Managoat.Broker.ProxyCase do
          store: {Memory, store},
          ca_seed: seed,
          allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, true),
-         upstream_ssl_options: [cacerts: [X509.Certificate.to_der(origin_ca)]]
+         upstream_ssl_options: [
+           cacerts: [X509.Certificate.to_der(origin_ca) | Keyword.get(opts, :extra_cacerts, [])]
+         ]
        ]}
     )
 

@@ -718,14 +718,21 @@ defmodule Managoat.Broker.Proxy do
     |> Kernel.++([family(address)])
   end
 
-  # RFC 6066 has no name to put in SNI for an origin named by address, and
-  # forbids sending one; the certificate is matched against the address
-  # itself instead. Appended after the merge rather than merged, because a
-  # family is a bare atom and the list above stays a keyword list so a
-  # host's own options can merge over it.
+  # RFC 6066 has no name to put in SNI for an origin named by address and
+  # forbids sending one, so the option is **omitted** for a literal —
+  # never set to `:disable`, which turns hostname verification off
+  # altogether: `:ssl` would then accept a certificate naming any address
+  # at all. Omitted, `:ssl` falls back to the `Host` argument of
+  # `connect/4`, which is the vetted address tuple, and verifies the
+  # certificate's `iPAddress` SAN against it.
+  #
+  # For a name the option stays load-bearing, because the proxy dials the
+  # vetted address rather than the name: without it `:ssl` would verify
+  # the tuple against a certificate full of DNS names and refuse every
+  # origin.
   defp sni(host) do
     case :inet.parse_address(String.to_charlist(host)) do
-      {:ok, _address} -> [server_name_indication: :disable]
+      {:ok, _address} -> []
       {:error, _} -> [server_name_indication: String.to_charlist(host)]
     end
   end
