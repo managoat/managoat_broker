@@ -89,7 +89,9 @@ defmodule Managoat.Broker.Proxy do
       store: Keyword.fetch!(opts, :store),
       certs: Keyword.fetch!(opts, :certs),
       allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, false),
-      upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, [])
+      upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
+      max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
+      max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity)
     }
 
     serve_client(socket, "", state, @auth_attempts)
@@ -254,11 +256,26 @@ defmodule Managoat.Broker.Proxy do
           # in one `receive`. It also owns every terminal event for a
           # forwarded request, including the ones this connection never
           # gets an answer to: `stop_relay/2` tells it why.
-          relay = spawn_link(fn -> relay(upstream, client, Response.new()) end)
+          relay =
+            spawn_link(fn -> relay(upstream, client, Response.new(state.max_response_bytes)) end)
+
           :ok = :ssl.controlling_process(upstream, relay)
           :ok = :ssl.setopts(upstream, active: :once)
 
-          reason = serve(client, upstream, host, port, session, relay, "")
+          # Everything about this tunnel that does not change per request,
+          # gathered once so the per-request functions take what varies.
+          conn = %{
+            client: client,
+            upstream: upstream,
+            host: host,
+            port: port,
+            session: session,
+            relay: relay,
+            max_request_bytes: state.max_request_bytes
+          }
+
+          reason = serve(conn, "")
+
           stop_relay(relay, reason)
           :ssl.close(upstream)
           :ssl.close(client)
@@ -450,7 +467,15 @@ defmodule Managoat.Broker.Proxy do
           :ok ->
             {framer, finished} = Response.observe(framer, data)
             Enum.each(finished, &emit_finished/1)
-            relay(upstream, client, framer)
+
+            # A response past its cap has already emitted; closing the
+            # sandbox's side is what tells it the stream ended badly.
+            if Response.halted?(framer) do
+              :ssl.close(client)
+              :ok
+            else
+              relay(upstream, client, framer)
+            end
 
           {:error, _} ->
             finish_relay(framer, &Response.failed(&1, :client_closed))
@@ -501,63 +526,106 @@ defmodule Managoat.Broker.Proxy do
   # Sandbox → upstream, one request at a time: head rewritten, body copied.
   # Returns why the loop ended, which is the reason any request still
   # awaiting a response gets.
-  defp serve(client, upstream, host, port, session, relay, buffer) do
+  defp serve(conn, buffer) do
     case HTTP.parse_request(buffer) do
       {:ok, head, rest} ->
-        case Injector.inject(head.headers, host, port, head.target, session) do
-          {:ok, headers, target, rule} ->
-            # `head` is the target the client sent; `target` is the one to
-            # forward. Telemetry is derived from the former, so a
-            # substituted credential is never what gets logged.
-            request = pending_request(session, head, host, {:ok, rule})
+        framing = HTTP.body_framing(head)
 
-            # Before the write, never after: an origin may answer faster
-            # than the next line of code runs.
-            send(relay, {:expect, request})
-
-            encoded = HTTP.encode_request(%{head | headers: headers}, target)
-
-            with :ok <- :ssl.send(upstream, encoded),
-                 {:ok, rest} <- copy_body(client, upstream, HTTP.body_framing(head), rest) do
-              if upgrade?(head),
-                do: pipe(client, upstream, rest),
-                else: serve(client, upstream, host, port, session, relay, rest)
-            else
-              # The relay holds this request; it emits with the reason
-              # `stop_relay/2` passes on.
-              {:error, _} -> :upstream_send_failed
-            end
-
-          {:error, reason} ->
-            refuse_request(session, head, host, reason)
-            reply(client, 403, "Forbidden", [{"connection", "close"}])
-            :client_closed
+        if declared_too_large?(framing, conn.max_request_bytes) do
+          # A declared length over the cap is refused before the origin is
+          # told anything, so the request never half-arrives there.
+          refuse_request(conn.session, head, conn.host, :request_too_large)
+          reply(conn.client, 413, "Content Too Large", [{"connection", "close"}])
+          :client_closed
+        else
+          serve_injected(conn, head, rest, framing)
         end
 
       {:more, _} ->
-        case :ssl.recv(client, 0, @idle_timeout) do
-          {:ok, data} -> serve(client, upstream, host, port, session, relay, buffer <> data)
+        case :ssl.recv(conn.client, 0, @idle_timeout) do
+          {:ok, data} -> serve(conn, buffer <> data)
           {:error, _} -> :client_closed
         end
 
       {:error, _} ->
-        reply(client, 400, "Bad Request", [{"connection", "close"}])
+        reply(conn.client, 400, "Bad Request", [{"connection", "close"}])
         :client_closed
     end
   end
 
-  defp copy_body(client, upstream, framing, buffer) do
+  defp serve_injected(conn, head, rest, framing) do
+    case Injector.inject(head.headers, conn.host, conn.port, head.target, conn.session) do
+      {:ok, headers, target, rule} ->
+        # `head` is the target the client sent; `target` is the one to
+        # forward. Telemetry is derived from the former, so a substituted
+        # credential is never what gets logged.
+        request = pending_request(conn.session, head, conn.host, {:ok, rule})
+
+        # Before the write, never after: an origin may answer faster than
+        # the next line of code runs.
+        send(conn.relay, {:expect, request})
+
+        encoded = HTTP.encode_request(%{head | headers: headers}, target)
+
+        with :ok <- :ssl.send(conn.upstream, encoded),
+             {:ok, rest} <-
+               copy_body(conn.client, conn.upstream, framing, rest, conn.max_request_bytes) do
+          if upgrade?(head),
+            do: pipe(conn.client, conn.upstream, rest),
+            else: serve(conn, rest)
+        else
+          # The relay holds this request; it emits with the reason
+          # `stop_relay/2` passes on.
+          {:error, :request_too_large} -> :request_too_large
+          {:error, _} -> :upstream_send_failed
+        end
+
+      {:error, reason} ->
+        refuse_request(conn.session, head, conn.host, reason)
+        reply(conn.client, 403, "Forbidden", [{"connection", "close"}])
+        :client_closed
+    end
+  end
+
+  # A body whose length the client declared, compared with the cap before
+  # anything is forwarded. A chunked body declares nothing, so it is
+  # counted as it streams instead — see `copy_body/5`.
+  defp declared_too_large?({:length, n}, limit) when is_integer(limit), do: n > limit
+  defp declared_too_large?(_framing, _limit), do: false
+
+  defp within?(_count, :infinity), do: true
+  defp within?(count, limit), do: count <= limit
+
+  defp copy_body(client, upstream, framing, buffer, limit) do
+    copy_body(client, upstream, framing, buffer, limit, 0)
+  end
+
+  # `count` is the bytes forwarded so far. For a chunked body those include
+  # the chunk framing, which the proxy forwards verbatim, so the cap is
+  # very slightly conservative — deliberately, since the alternative is
+  # parsing a body this proxy has no business reading.
+  defp copy_body(client, upstream, framing, buffer, limit, count) do
     case HTTP.take_body(framing, buffer) do
       {:done, bytes, rest} ->
-        send_upstream(upstream, bytes)
-        {:ok, rest}
+        if within?(count + byte_size(bytes), limit) do
+          send_upstream(upstream, bytes)
+          {:ok, rest}
+        else
+          {:error, :request_too_large}
+        end
 
       {:partial, bytes, framing} ->
-        send_upstream(upstream, bytes)
+        count = count + byte_size(bytes)
 
-        case :ssl.recv(client, 0, @idle_timeout) do
-          {:ok, data} -> copy_body(client, upstream, framing, data)
-          {:error, reason} -> {:error, reason}
+        if within?(count, limit) do
+          send_upstream(upstream, bytes)
+
+          case :ssl.recv(client, 0, @idle_timeout) do
+            {:ok, data} -> copy_body(client, upstream, framing, data, limit, count)
+            {:error, reason} -> {:error, reason}
+          end
+        else
+          {:error, :request_too_large}
         end
     end
   end
@@ -589,7 +657,10 @@ defmodule Managoat.Broker.Proxy do
   # Absolute-form: one plain-HTTP request, its response, then close
 
   defp forward_plain(socket, head, rest, host, port, target, session, state) do
-    with {:ok, headers, target, rule} <-
+    framing = HTTP.body_framing(head)
+
+    with false <- oversized_plain(socket, session, head, host, framing, state),
+         {:ok, headers, target, rule} <-
            inject_or_deny(socket, head, host, port, target, session),
          {:ok, addresses} <- resolve(socket, host, port, state),
          {:ok, upstream} <- connect_plain(socket, addresses, host, port) do
@@ -602,19 +673,31 @@ defmodule Managoat.Broker.Proxy do
 
       # One request, so the framer here is a queue of one and the handler
       # itself relays and frames; no second process to correlate with.
-      framer = Response.expect(Response.new(), pending_request(session, head, host, {:ok, rule}))
+      framer =
+        Response.expect(
+          Response.new(state.max_response_bytes),
+          pending_request(session, head, host, {:ok, rule})
+        )
+
       encoded = HTTP.encode_request(%{head | headers: headers}, target)
 
       with :ok <- :gen_tcp.send(upstream, encoded),
-           :ok <- copy_body_plain(socket, upstream, HTTP.body_framing(head), rest) do
-        pump_plain(upstream, socket, framer)
+           :ok <- copy_body_plain(socket, upstream, framing, rest, state.max_request_bytes) do
+        pump_plain(upstream, socket, framer, state.max_response_bytes)
       else
-        {:error, _} -> finish_relay(framer, &Response.failed(&1, :upstream_send_failed))
+        {:error, :request_too_large} ->
+          finish_relay(framer, &Response.failed(&1, :request_too_large))
+
+        {:error, _} ->
+          finish_relay(framer, &Response.failed(&1, :upstream_send_failed))
       end
 
       :gen_tcp.close(upstream)
       {:close, state}
     else
+      true ->
+        {:close, state}
+
       {:error, reason} when reason in [:denied, :private_upstream] ->
         connect_event(session, host, port, :denied)
         {:close, state}
@@ -622,6 +705,21 @@ defmodule Managoat.Broker.Proxy do
       {:error, _} ->
         connect_event(session, host, port, :upstream_failed)
         {:close, state}
+    end
+  end
+
+  # `true` when the request is refused for its size, having answered the
+  # client. The `403` paths below return `{:error, _}`; this one is its own
+  # shape so the `with` can tell them apart without inventing a reason
+  # that means "already answered".
+  defp oversized_plain(socket, session, head, host, framing, state) do
+    if declared_too_large?(framing, state.max_request_bytes) do
+      refuse_request(session, head, host, :request_too_large)
+      connect_event(session, host, nil, :denied)
+      reply(socket, 413, "Content Too Large")
+      true
+    else
+      false
     end
   end
 
@@ -658,18 +756,32 @@ defmodule Managoat.Broker.Proxy do
   defp family(address) when tuple_size(address) == 8, do: :inet6
   defp family(_address), do: :inet
 
-  defp copy_body_plain(client, upstream, framing, buffer) do
+  defp copy_body_plain(client, upstream, framing, buffer, limit) do
+    copy_body_plain(client, upstream, framing, buffer, limit, 0)
+  end
+
+  defp copy_body_plain(client, upstream, framing, buffer, limit, count) do
     case HTTP.take_body(framing, buffer) do
       {:done, bytes, _rest} ->
-        if bytes != "", do: :gen_tcp.send(upstream, bytes)
-        :ok
+        if within?(count + byte_size(bytes), limit) do
+          if bytes != "", do: :gen_tcp.send(upstream, bytes)
+          :ok
+        else
+          {:error, :request_too_large}
+        end
 
       {:partial, bytes, framing} ->
-        if bytes != "", do: :gen_tcp.send(upstream, bytes)
+        count = count + byte_size(bytes)
 
-        case Socket.recv(client, 0, @idle_timeout) do
-          {:ok, data} -> copy_body_plain(client, upstream, framing, data)
-          {:error, reason} -> {:error, reason}
+        if within?(count, limit) do
+          if bytes != "", do: :gen_tcp.send(upstream, bytes)
+
+          case Socket.recv(client, 0, @idle_timeout) do
+            {:ok, data} -> copy_body_plain(client, upstream, framing, data, limit, count)
+            {:error, reason} -> {:error, reason}
+          end
+        else
+          {:error, :request_too_large}
         end
     end
   end
@@ -679,14 +791,19 @@ defmodule Managoat.Broker.Proxy do
   # response ended. The loop still runs to the origin's close — the proxy
   # sent `Connection: close`, so that is the end of the exchange — but the
   # event fires when the body completes, not when the socket does.
-  defp pump_plain(upstream, client, framer) do
+  defp pump_plain(upstream, client, framer, limit) do
     case :gen_tcp.recv(upstream, 0, @idle_timeout) do
       {:ok, data} ->
         case Socket.send(client, data) do
           :ok ->
             {framer, finished} = Response.observe(framer, data)
             Enum.each(finished, &emit_finished/1)
-            pump_plain(upstream, client, framer)
+
+            # A response past its cap has already emitted; nothing is left
+            # to relay it to.
+            if Response.halted?(framer),
+              do: :ok,
+              else: pump_plain(upstream, client, framer, limit)
 
           {:error, _} ->
             finish_relay(framer, &Response.failed(&1, :client_closed))
@@ -803,8 +920,11 @@ defmodule Managoat.Broker.Proxy do
 
     session
     |> pending_request(head, host, {:error, :denied})
-    |> emit(403, nil)
+    |> emit(refusal_status(reason), nil)
   end
+
+  defp refusal_status(:request_too_large), do: 413
+  defp refusal_status(_reason), do: 403
 
   defp emit_finished({request, status, error}), do: emit(request, status, error)
 

@@ -254,6 +254,59 @@ defmodule Managoat.Broker.ResponseTest do
       assert Response.idle?(state)
     end
 
+    test "a response past its cap ends with response_too_large and stops framing" do
+      {state, finished} =
+        Response.new(10)
+        |> Response.expect(req(:a))
+        |> observe("HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n01234567890123456789")
+
+      assert finished == [{:a, 200, :response_too_large}]
+      assert Response.halted?(state)
+
+      # Framing is over: the relay closes on `halted?`, and nothing after
+      # this is attributed to anything.
+      {_state, finished} = observe(state, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+      assert finished == []
+    end
+
+    test "the cap counts one response at a time, not the connection" do
+      # Two responses of 6 bytes each under a 10-byte cap both pass; a
+      # counter that never reset would fail the second.
+      body = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabcdef"
+
+      {state, finished} =
+        Response.new(10)
+        |> Response.expect(req(:a))
+        |> Response.expect(req(:b))
+        |> observe(body <> body)
+
+      assert finished == [{:a, 200, nil}, {:b, 200, nil}]
+      refute Response.halted?(state)
+    end
+
+    test "a body arriving in pieces is capped on the total, not the piece" do
+      state = Response.expect(Response.new(10), req(:a))
+      {state, finished} = observe(state, "HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n1234")
+      assert finished == []
+
+      {state, finished} = observe(state, "5678")
+      assert finished == []
+
+      {state, finished} = observe(state, "9012")
+      assert finished == [{:a, 200, :response_too_large}]
+      assert Response.halted?(state)
+    end
+
+    test "the default cap is no cap" do
+      {state, finished} =
+        Response.new()
+        |> Response.expect(req(:a))
+        |> observe("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+
+      assert finished == [{:a, 200, nil}]
+      refute Response.halted?(state)
+    end
+
     test "a close with nothing outstanding says nothing" do
       assert {_, []} = Response.closed(Response.new())
       assert {_, []} = Response.failed(Response.new(), :client_closed)

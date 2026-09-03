@@ -39,6 +39,8 @@ defmodule Managoat.Broker.Response do
   | `:malformed_response` | the origin's head did not parse, or never ended |
   | `:upstream_closed` | the origin closed before its framed body was done |
   | `:client_closed` | the sandbox went away before the relay finished |
+  | `:request_too_large` | the request body passed the configured cap |
+  | `:response_too_large` | the response body passed the configured cap |
 
   A response whose head parsed and whose body then failed carries both its
   status and its error.
@@ -60,6 +62,8 @@ defmodule Managoat.Broker.Response do
           | :malformed_response
           | :upstream_closed
           | :client_closed
+          | :request_too_large
+          | :response_too_large
 
   @typedoc "A finished request: what it was, the status it got, why it failed."
   @type finished :: {request(), 100..599 | nil, reason() | nil}
@@ -68,7 +72,9 @@ defmodule Managoat.Broker.Response do
           pending: [request()],
           current: {request(), 100..599, HTTP.framing()} | nil,
           buffer: binary(),
-          mode: :framing | :done
+          mode: :framing | :done | :halt,
+          limit: pos_integer() | :infinity,
+          body: non_neg_integer()
         }
 
   # `pending` is a plain list appended to at the end. It holds the requests
@@ -76,11 +82,35 @@ defmodule Managoat.Broker.Response do
   # client pipelines, so the append is cheaper than the machinery a queue
   # would bring — and a queue's type is opaque, which would make this
   # struct opaque to the proxy that has to carry it.
-  defstruct pending: [], current: nil, buffer: "", mode: :framing
+  defstruct pending: [],
+            current: nil,
+            buffer: "",
+            mode: :framing,
+            limit: :infinity,
+            body: 0
 
-  @doc "A framer with nothing outstanding."
-  @spec new() :: t()
-  def new, do: %__MODULE__{}
+  @doc """
+  A framer with nothing outstanding, capping each response body at `limit`
+  bytes (`:infinity`, the default, for no cap).
+
+  A cap here can only end a response, never prevent one: the proxy writes
+  every byte to the sandbox before this module sees it, which is what
+  keeps a stream a stream. So an over-long response reaches the sandbox up
+  to roughly the limit and the connection is then torn down, rather than
+  being answered with a status. Agent Vault's response cap ends the same
+  way — it aborts the connection mid-stream — and defaults to unlimited,
+  which is why this does too.
+  """
+  @spec new(pos_integer() | :infinity) :: t()
+  def new(limit \\ :infinity), do: %__MODULE__{limit: limit}
+
+  @doc """
+  Has framing stopped because a response passed its cap? The relay closes
+  the connection when it has; nothing else ends a response early.
+  """
+  @spec halted?(t()) :: boolean()
+  def halted?(%__MODULE__{mode: :halt}), do: true
+  def halted?(%__MODULE__{}), do: false
 
   @doc """
   Note a request written upstream. Call this *before* the write: an origin
@@ -134,17 +164,29 @@ defmodule Managoat.Broker.Response do
 
   # Framing has stopped: an upgrade, or a response nothing asked for. The
   # bytes still reach the sandbox; this module has nothing left to say.
-  defp step(%__MODULE__{mode: :done} = state, _data, finished), do: {state, finished}
+  defp step(%__MODULE__{mode: mode} = state, _data, finished) when mode in [:done, :halt],
+    do: {state, finished}
 
   defp step(%__MODULE__{current: {_, _, _}} = state, data, finished) do
     {request, status, framing} = state.current
 
     case HTTP.take_body(framing, data) do
-      {:done, _consumed, rest} ->
-        step(%{state | current: nil}, rest, finished ++ [{request, status, nil}])
+      {:done, consumed, rest} ->
+        if over_limit?(state, consumed) do
+          {%{state | current: nil, mode: :halt},
+           finished ++ [{request, status, :response_too_large}]}
+        else
+          step(%{state | current: nil, body: 0}, rest, finished ++ [{request, status, nil}])
+        end
 
-      {:partial, _consumed, framing} ->
-        {%{state | current: {request, status, framing}}, finished}
+      {:partial, consumed, framing} ->
+        if over_limit?(state, consumed) do
+          {%{state | current: nil, mode: :halt},
+           finished ++ [{request, status, :response_too_large}]}
+        else
+          {%{state | current: {request, status, framing}, body: state.body + byte_size(consumed)},
+           finished}
+        end
     end
   end
 
@@ -166,6 +208,11 @@ defmodule Managoat.Broker.Response do
     end
   end
 
+  defp over_limit?(%__MODULE__{limit: :infinity}, _consumed), do: false
+
+  defp over_limit?(%__MODULE__{limit: limit, body: body}, consumed),
+    do: body + byte_size(consumed) > limit
+
   # `100 Continue` and its kin precede the real response to the same
   # request, so the descriptor stays where it is.
   defp head(state, %{status: status}, rest, finished) when status in 100..199 and status != 101 do
@@ -183,7 +230,7 @@ defmodule Managoat.Broker.Response do
           {%{state | mode: :done}, finished ++ [{request, head.status, nil}]}
         else
           framing = HTTP.response_framing(head.status, head.headers, method(request))
-          step(%{state | current: {request, head.status, framing}}, rest, finished)
+          step(%{state | current: {request, head.status, framing}, body: 0}, rest, finished)
         end
 
       [] ->
