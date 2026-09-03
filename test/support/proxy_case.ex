@@ -63,6 +63,7 @@ defmodule Managoat.Broker.ProxyCase do
         Jason.encode!(%{
           method: conn.method,
           path: conn.request_path,
+          query: conn.query_string,
           headers: Map.new(conn.req_headers),
           body: body
         })

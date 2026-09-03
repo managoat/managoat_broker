@@ -146,6 +146,14 @@ never a body. The host attaches a handler and writes its log line with
 whatever `meta` carries; the library logs only refusals, which have no
 session to attribute.
 
+`path` is the URL path and nothing else. A query string never appears in
+it, on either request path, because a query can already hold a credential
+this proxy never brokered — a signed URL is one in itself, and `?key=` is
+a shape clients use. The origin receives the request target unchanged;
+only the event is narrowed. This is Agent Vault's contract too: its
+request log recorded `r.URL.Path`. A `CONNECT` names an authority rather
+than a path, and is reported as it was sent.
+
 ## Deviations from Agent Vault
 
 This proxy replaced Infisical's Agent Vault behind the same interface. The
