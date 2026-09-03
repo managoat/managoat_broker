@@ -332,6 +332,62 @@ defmodule Managoat.Broker.ProxyTest do
     assert_receive {:request, _, %{path: "/no", outcome: :denied, rule: nil}}
   end
 
+  test "the request log carries the path and never the query, on both request paths", ctx do
+    # A query can hold a credential the proxy never brokered — a signed URL
+    # is one in itself — so the event's `path` is the URL path alone, while
+    # the origin still receives the target byte for byte.
+    secret = "sig-#{System.unique_integer([:positive])}-do-not-log"
+
+    handler = "query-test-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler,
+      [:managoat, :broker, :request],
+      fn _e, measurements, meta, pid -> send(pid, {:request, measurements, meta}) end,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    # Inside a CONNECT tunnel, where the target is origin-form.
+    tls = tunnel(ctx, ctx.token)
+
+    {_, echoed} =
+      request(tls, "GET /tunneled?token=#{secret} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+    assert echoed["path"] == "/tunneled"
+    assert echoed["query"] == "token=#{secret}"
+
+    assert_receive {:request, _, %{path: "/tunneled"} = tunneled_meta}
+    refute_logged(tunneled_meta, secret)
+
+    # Absolute-form plain HTTP, where the target is a whole URL.
+    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+    :ok =
+      :gen_tcp.send(
+        tcp,
+        "GET http://localhost:#{ctx.http_port}/absolute?token=#{secret} HTTP/1.1\r\n" <>
+          "Host: localhost\r\nProxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
+      )
+
+    [_, body] = String.split(read_until_closed(tcp), "\r\n\r\n", parts: 2)
+    echoed = Jason.decode!(body)
+
+    assert echoed["path"] == "/absolute"
+    assert echoed["query"] == "token=#{secret}"
+
+    assert_receive {:request, _, %{path: "/absolute"} = absolute_meta}
+    refute_logged(absolute_meta, secret)
+  end
+
+  # The event's own fields, whatever their shape, must not contain `secret`
+  # anywhere: asserting on `path` alone would miss it leaking into another
+  # field later.
+  defp refute_logged(meta, secret) do
+    refute inspect(meta) =~ secret
+  end
+
   # ---------------------------------------------------------------------------
   # The 407 is an invitation to retry, not a dead end
 

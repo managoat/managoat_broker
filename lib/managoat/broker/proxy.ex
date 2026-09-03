@@ -23,7 +23,10 @@ defmodule Managoat.Broker.Proxy do
   :request]` with `%{count: 1}` and the metadata `method`, `host`, `path`,
   `outcome` (`:injected`, `:passthrough` or `:denied`), `rule` (the matched
   rule's name or nil) and `meta` (the session's, unchanged). Never a header,
-  never a body. The host attaches a handler and writes its log line.
+  never a body, and `path` is the URL path only — never a query string or a
+  fragment, on either request path, because a query can carry a credential
+  the proxy never saw. The origin still receives the target unchanged. The
+  host attaches a handler and writes its log line.
 
   Beside it, every connection the proxy decides about emits `[:managoat,
   :broker, :connect]` with `%{count: 1}` and the metadata `host`, `port`,
@@ -529,7 +532,7 @@ defmodule Managoat.Broker.Proxy do
     :telemetry.execute([:managoat, :broker, :request], %{count: 1}, %{
       method: head.method,
       host: host,
-      path: path_only(head.target),
+      path: path_only(head),
       outcome: outcome,
       rule: rule,
       meta: meta
@@ -555,6 +558,23 @@ defmodule Managoat.Broker.Proxy do
   defp session_meta(%Session{meta: meta}), do: meta
   defp session_meta(nil), do: %{}
 
-  defp path_only("http://" <> _ = target), do: URI.parse(target).path || "/"
-  defp path_only(target), do: target
+  # The `path` a request event carries: the URL path, and nothing else.
+  #
+  # A query string is not safe to log. It can already hold a credential
+  # nobody brokered — a signed URL is one in itself, and an API key in
+  # `?key=` is a shape clients use — so the invariant that no credential
+  # reaches a host's log cannot wait on what the proxy substitutes. Both
+  # request paths converge here and both drop the query and any fragment:
+  # absolute-form targets arrive as `http://host/path?query`, and
+  # origin-form ones from inside a tunnel as `/path?query`. The origin is
+  # sent the target unchanged; only the event is narrowed.
+  #
+  # `CONNECT` names an authority, not a path, and an authority has no query
+  # to leak, so it is reported as it was sent.
+  defp path_only(%{method: "CONNECT", target: target}), do: target
+  defp path_only(%{target: "http://" <> _ = target}), do: URI.parse(target).path || "/"
+
+  defp path_only(%{target: target}) do
+    target |> String.split(["?", "#"], parts: 2) |> hd()
+  end
 end

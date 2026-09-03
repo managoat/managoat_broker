@@ -10,6 +10,22 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-03
+
+### Fixed
+
+- The `path` on `[:managoat, :broker, :request]` is now the URL path alone,
+  on both request paths. An origin-form request inside a `CONNECT` tunnel
+  was logged with its whole target, query string included, while an
+  absolute-form plain-HTTP request was not; `GET /x?token=... HTTP/1.1`
+  down a tunnel therefore put the query into a host's audit log. A query
+  can hold a credential this proxy never brokered — a signed URL is one in
+  itself — so the no-credential-in-logs invariant cannot depend on what the
+  proxy substitutes. Queries and fragments are now dropped from the event
+  on both paths; the origin still receives the request target byte for
+  byte. This matches Agent Vault, whose request log recorded `r.URL.Path`.
+  Row 0 of #5.
+
 ## [0.1.2] - 2026-09-03
 
 ### Fixed
