@@ -104,6 +104,10 @@ defmodule Managoat.Broker.Injector do
   Does a rule `pattern` (`host[:port][/path]`) match this request? An IPv6
   literal is bracketed — `[::1]` or `[::1]:8443` — because otherwise there
   is no telling which colon is the port separator.
+
+  An address is compared by its value, not its spelling: `[::1]`,
+  `[::0001]` and `[0:0:0:0:0:0:0:1]` are one pattern. A name is compared
+  case-insensitively, as before.
   """
   @spec matches?(String.t(), String.t(), :inet.port_number(), String.t()) :: boolean()
   def matches?(pattern, host, port, path) when is_binary(pattern) do
@@ -115,8 +119,22 @@ defmodule Managoat.Broker.Injector do
 
     {host_pattern, port_pattern} = split_host_pattern(host_part)
 
-    host_pattern_matches?(String.downcase(host_pattern), String.downcase(host)) and
+    host_pattern_matches?(canonical(host_pattern), canonical(host)) and
       port_matches?(port_pattern, port) and path_matches?(path_part, path)
+  end
+
+  # An address has many spellings and one meaning: `::1`, `::0001` and
+  # `0:0:0:0:0:0:0:1` are the same host, and `10.0.0.1` is not
+  # `10.00.00.01`. A pattern that matched only the spelling the operator
+  # happened to type would fail silently — the credential simply would not
+  # be attached — so both sides go through the resolver's own text form
+  # first. Anything that is not an address is a name, and names are matched
+  # case-insensitively as before.
+  defp canonical(host) do
+    case :inet.parse_address(String.to_charlist(host)) do
+      {:ok, address} -> address |> :inet.ntoa() |> List.to_string()
+      {:error, _} -> String.downcase(host)
+    end
   end
 
   # `host`, `host:port`, `[v6]` or `[v6]:port`. An IPv6 literal is full of

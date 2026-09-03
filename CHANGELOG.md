@@ -30,6 +30,13 @@ that worked before behaves differently.
   first colon reads as the port separator, so it matches nothing rather
   than matching somewhere else by accident.
 
+  A pattern that is an address is matched by **value**, not by spelling, on
+  both sides: `[::1]`, `[::0001]` and `[0:0:0:0:0:0:0:1]` are one pattern,
+  and a client naming any of them matches any of them. Matching the text
+  would have failed silently — no rule matched, so no credential attached
+  and no error — which is the worst way for a rule to be wrong. A name is
+  still matched case-insensitively.
+
 - A leaf certificate for a literal host carries an `iPAddress` SAN in the
   four or sixteen octets RFC 5280 asks for, rather than a `dNSName` of the
   address's text. A client verifying an address looks for exactly that, so

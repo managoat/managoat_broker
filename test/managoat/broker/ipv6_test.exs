@@ -116,6 +116,33 @@ defmodule Managoat.Broker.IPv6Test do
       refute Injector.host_matches?("[::1]:8443/api", "::1", 443)
     end
 
+    test "an address is matched by value, not by spelling" do
+      # One address has many spellings. A pattern that matched only the one
+      # the operator typed would fail silently — no credential attached,
+      # no error — so both sides are canonicalised first.
+      for spelling <- ["[::1]", "[::0001]", "[0:0:0:0:0:0:0:1]", "[0000:0000::0001]"] do
+        assert Injector.matches?(spelling, "::1", 443, "/x"), "pattern #{spelling}"
+
+        assert Injector.matches?(
+                 "[::1]",
+                 spelling |> String.trim("[") |> String.trim("]"),
+                 443,
+                 "/x"
+               ),
+               "host #{spelling}"
+      end
+
+      assert Injector.matches?("[2001:0db8:0000::1]", "2001:db8::1", 443, "/x")
+      refute Injector.matches?("[::2]", "::1", 443, "/x")
+
+      # IPv4 too: an address is an address.
+      assert Injector.matches?("127.0.0.1", "127.0.0.1", 443, "/x")
+      refute Injector.matches?("127.0.0.1", "127.0.0.2", 443, "/x")
+
+      # A name is still a name, matched case-insensitively.
+      assert Injector.matches?("API.Example.com", "api.example.com", 443, "/x")
+    end
+
     test "a bracketed pattern that is never closed matches nothing" do
       # An unclosed bracket is taken literally rather than being read as a
       # host called `[` with the port `:1`, which would match somewhere
