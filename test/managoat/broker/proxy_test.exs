@@ -206,6 +206,21 @@ defmodule Managoat.Broker.ProxyTest do
         do: refute(Proxy.private?(ip))
   end
 
+  test "the rig refuses to pretend a refused CONNECT opened a tunnel", ctx do
+    # Without this the helper would hand back a socket the proxy has
+    # already answered 403 on, and every later assertion would fail
+    # somewhere else entirely.
+    Memory.put(ctx.store, ctx.token, %{
+      ctx.session
+      | rules: [%Rule{name: "only", pattern: "elsewhere.test", scheme: :passthrough}],
+        unmatched_host_policy: :deny
+    })
+
+    assert_raise RuntimeError, ~r/answered .*403/, fn ->
+      tunnel(ctx, ctx.token)
+    end
+  end
+
   test "a passthrough host is forwarded untouched", ctx do
     # A session whose rules name another host: nothing matches localhost.
     Memory.put(ctx.store, ctx.token, %{ctx.session | rules: []})
@@ -288,16 +303,8 @@ defmodule Managoat.Broker.ProxyTest do
   end
 
   test "the request log names the session's meta and the rule, never a header", ctx do
-    handler = "proxy-test-#{System.unique_integer([:positive])}"
-
-    :telemetry.attach(
-      handler,
-      [:managoat, :broker, :request],
-      fn _e, measurements, meta, pid -> send(pid, {:request, measurements, meta}) end,
-      self()
-    )
-
-    on_exit(fn -> :telemetry.detach(handler) end)
+    session = attach_request_telemetry(ctx)
+    ctx = %{ctx | session: session}
 
     tls = tunnel(ctx, ctx.token)
     request(tls, "GET /logged HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer x\r\n\r\n")
@@ -338,16 +345,7 @@ defmodule Managoat.Broker.ProxyTest do
     # the origin still receives the target byte for byte.
     secret = "sig-#{System.unique_integer([:positive])}-do-not-log"
 
-    handler = "query-test-#{System.unique_integer([:positive])}"
-
-    :telemetry.attach(
-      handler,
-      [:managoat, :broker, :request],
-      fn _e, measurements, meta, pid -> send(pid, {:request, measurements, meta}) end,
-      self()
-    )
-
-    on_exit(fn -> :telemetry.detach(handler) end)
+    attach_request_telemetry(ctx)
 
     # Inside a CONNECT tunnel, where the target is origin-form.
     tls = tunnel(ctx, ctx.token)
@@ -387,7 +385,7 @@ defmodule Managoat.Broker.ProxyTest do
   describe "substitution into the request target" do
     setup ctx do
       session = %{
-        ctx.session
+        attach_request_telemetry(ctx)
         | rules: [
             %Rule{
               name: "bot",
@@ -400,7 +398,7 @@ defmodule Managoat.Broker.ProxyTest do
       }
 
       Memory.put(ctx.store, ctx.token, session)
-      :ok
+      %{session: session}
     end
 
     test "a placeholder in the path reaches the origin as the credential, through a tunnel",
@@ -445,17 +443,6 @@ defmodule Managoat.Broker.ProxyTest do
 
     test "the event carries the placeholder for a path, nothing for a query, never the credential",
          ctx do
-      handler = "sub-test-#{System.unique_integer([:positive])}"
-
-      :telemetry.attach(
-        handler,
-        [:managoat, :broker, :request],
-        fn _e, m, meta, pid -> send(pid, {:request, m, meta}) end,
-        self()
-      )
-
-      on_exit(fn -> :telemetry.detach(handler) end)
-
       tls = tunnel(ctx, ctx.token)
 
       # A path substitution: the event names the target the *client* sent,
@@ -501,6 +488,150 @@ defmodule Managoat.Broker.ProxyTest do
       # the rule.
       assert log =~ ~s(rule "bad")
       refute log =~ "GET /evil"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # The request event is terminal: it knows how the request ended
+
+  describe "the terminal request event" do
+    setup ctx do
+      %{session: attach_request_telemetry(ctx)}
+    end
+
+    test "a tunneled request carries its status, a duration and no error", ctx do
+      tls = tunnel(ctx, ctx.token)
+      request(tls, "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+      assert_receive {:request, %{count: 1, duration: duration},
+                      %{path: "/ok", status: 200, error: nil, outcome: :injected}}
+
+      assert is_integer(duration) and duration > 0
+    end
+
+    test "an absolute-form request carries its status too", ctx do
+      {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+      :ok =
+        :gen_tcp.send(
+          tcp,
+          "GET http://localhost:#{ctx.http_port}/plain-ok HTTP/1.1\r\nHost: localhost\r\n" <>
+            "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
+        )
+
+      read_until_closed(tcp)
+
+      assert_receive {:request, %{count: 1, duration: _},
+                      %{path: "/plain-ok", status: 200, error: nil}}
+    end
+
+    test "two keep-alive responses on one tunnel are attributed to the right requests", ctx do
+      tls = tunnel(ctx, ctx.token)
+
+      request(tls, "GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      assert_receive {:request, _, %{path: "/first", status: 200}}
+
+      # The origin answers 404 for nothing, so ask for a status that
+      # differs another way: a second request must get its own event.
+      request(tls, "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      assert_receive {:request, _, %{path: "/second", status: 200, error: nil}}
+
+      refute_receive {:request, _, _}, 100
+    end
+
+    test "a local refusal emits at once, with the status the proxy sent", ctx do
+      Memory.put(ctx.store, ctx.token, %{
+        ctx.session
+        | rules: [%Rule{name: "n", pattern: "localhost/ok", scheme: :passthrough}],
+          unmatched_host_policy: :deny
+      })
+
+      tls = tunnel(ctx, ctx.token)
+      :ok = :ssl.send(tls, "GET /no HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      {:ok, _} = :ssl.recv(tls, 0, 5_000)
+
+      assert_receive {:request, %{count: 1, duration: _},
+                      %{path: "/no", outcome: :denied, status: 403, error: nil}}
+    end
+
+    test "a streamed response still streams, and its event waits for the end", ctx do
+      tls = tunnel(ctx, ctx.token)
+      stream = "event_stream_#{System.unique_integer([:positive])}"
+
+      :ok =
+        :ssl.send(
+          tls,
+          "GET /stream HTTP/1.1\r\nHost: localhost\r\nX-Stream-Name: #{stream}\r\n\r\n"
+        )
+
+      # The first chunk reaches the sandbox before the response is over —
+      # framing must not have buffered it — and the event has not fired,
+      # because the request has not ended.
+      assert recv_until(tls, "data: first") =~ "data: first"
+      refute_receive {:request, _, _}, 100
+
+      send(String.to_atom(stream), :continue)
+      recv_until(tls, "data: second")
+
+      assert_receive {:request, %{duration: _}, %{path: "/stream", status: 200, error: nil}}
+    end
+
+    test "a WebSocket upgrade emits at the 101 and then leaves the frames alone", ctx do
+      tls = tunnel(ctx, ctx.token)
+
+      :ok =
+        :ssl.send(
+          tls,
+          "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n" <>
+            "Connection: Upgrade\r\nSec-WebSocket-Key: #{Base.encode64("0123456789abcdef")}\r\n" <>
+            "Sec-WebSocket-Version: 13\r\nAuthorization: Bearer __github_token__\r\n\r\n"
+        )
+
+      recv_until(tls, "101")
+      assert_receive {:request, %{duration: _}, %{path: "/ws", status: 101, error: nil}}
+
+      # The frames after it are still a byte pipe, and produce no events.
+      mask = <<1, 2, 3, 4>>
+      :ok = :ssl.send(tls, <<0x81, 0x82>> <> mask <> :crypto.exor("hi", binary_part(mask, 0, 2)))
+      {:ok, frame} = :ssl.recv(tls, 0, 5_000)
+      <<0x81, len, text::binary-size(len)>> = frame
+      assert text == "Bearer ghp_real|hi"
+
+      refute_receive {:request, _, _}, 100
+    end
+
+    test "an origin that closes the connection still ends its request cleanly", ctx do
+      # The upstream side of the tunnel goes away under the proxy's feet
+      # while the sandbox is still there. The response completed, so the
+      # event says so: a status and no error.
+      tls = tunnel(ctx, ctx.token)
+      :ok = :ssl.send(tls, "GET /close HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+      assert recv_until(tls, "closing") =~ "HTTP/1.1 200"
+      assert_receive {:request, %{duration: _}, %{path: "/close", status: 200, error: nil}}
+    end
+
+    test "a request whose answer never comes emits with a terminal error", ctx do
+      # The sandbox sends a request and walks away before the origin has
+      # answered. The event still has to be emitted, and has to say why it
+      # has no status.
+      tls = tunnel(ctx, ctx.token)
+      stream = "abandoned_#{System.unique_integer([:positive])}"
+
+      :ok =
+        :ssl.send(
+          tls,
+          "GET /stream HTTP/1.1\r\nHost: localhost\r\nX-Stream-Name: #{stream}\r\n\r\n"
+        )
+
+      recv_until(tls, "data: first")
+      :ok = :ssl.close(tls)
+      send(String.to_atom(stream), :continue)
+
+      assert_receive {:request, %{duration: _}, %{path: "/stream", status: 200, error: error}},
+                     2_000
+
+      assert error in [:client_closed, :upstream_closed]
     end
   end
 

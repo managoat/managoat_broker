@@ -15,18 +15,34 @@ defmodule Managoat.Broker.Proxy do
   completes a TLS handshake with the *sandbox* using a leaf for that host
   signed by the listener's `Managoat.Broker.CA`, which the sandbox trusts
   because the host installed the root. Inside the tunnel it reads each
-  request head, lets `Managoat.Broker.Injector` rewrite the headers, and
-  forwards the head and body to the origin. Bytes coming back are relayed
-  untouched and unparsed, so a streaming model reply streams.
+  request head, lets `Managoat.Broker.Injector` rewrite the headers and the
+  request target, and forwards the head and body to the origin. Bytes
+  coming back are relayed untouched, so a streaming model reply streams.
+
+  They are also framed. `Managoat.Broker.Response` watches the same bytes
+  *after* they have gone to the sandbox and works out which request each
+  response belongs to, what status it carried and when it ended. Framing is
+  therefore never in the relay's way: it cannot delay or buffer a body, and
+  when it fails the cost is telemetry rather than the response.
 
   Every request the proxy decides about emits `[:managoat, :broker,
-  :request]` with `%{count: 1}` and the metadata `method`, `host`, `path`,
-  `outcome` (`:injected`, `:passthrough` or `:denied`), `rule` (the matched
-  rule's name or nil) and `meta` (the session's, unchanged). Never a header,
-  never a body, and `path` is the URL path only — never a query string or a
-  fragment, on either request path, because a query can carry a credential
-  the proxy never saw. The origin still receives the target unchanged. The
-  host attaches a handler and writes its log line.
+  :request]` with `%{count: 1, duration: native}` and the metadata
+  `method`, `host`, `path`, `outcome` (`:injected`, `:passthrough` or
+  `:denied`), `rule` (the matched rule's name or nil), `status`, `error`
+  and `meta` (the session's, unchanged). Never a header, never a body, and
+  `path` is the URL path only — never a query string or a fragment, on
+  either request path, because a query can carry a credential the proxy
+  never saw. The origin still receives the target unchanged. The host
+  attaches a handler and writes its log line.
+
+  The event is **terminal**: exactly one per request, emitted when the
+  request is over. An upstream response emits when its body completes or
+  fails, carrying the origin's status and a monotonic `duration` that spans
+  the whole request through the end of the response body. A refusal the
+  proxy makes itself emits at once, with the status the proxy sent. `error`
+  is nil on a completed request and otherwise names why it did not
+  complete; a response whose head arrived and whose body then failed
+  carries both. So a long-lived stream is not recorded until it ends.
 
   Beside it, every connection the proxy decides about emits `[:managoat,
   :broker, :connect]` with `%{count: 1}` and the metadata `host`, `port`,
@@ -46,12 +62,17 @@ defmodule Managoat.Broker.Proxy do
 
   require Logger
 
-  alias Managoat.Broker.{Certs, HTTP, Injector, Session, Store}
+  alias Managoat.Broker.{Certs, HTTP, Injector, Response, Session, Store}
   alias ThousandIsland.Socket
 
   @head_timeout 30_000
   @idle_timeout 300_000
   @connect_timeout 10_000
+
+  # How long the handler waits for the relay to emit the terminal events
+  # for requests that never got an answer. A telemetry event is not worth
+  # hanging a connection teardown on.
+  @relay_stop_timeout 1_000
 
   # How many times one connection may be answered with a `407` before the
   # proxy stops reading from it. Two is enough for the negotiation this
@@ -86,7 +107,7 @@ defmodule Managoat.Broker.Proxy do
           if reachable?(session, host, port) do
             tunnel(socket, host, port, session, state)
           else
-            log_request(session, head, host, {:error, :denied})
+            refuse_request(session, head, host, :denied)
             connect_event(session, host, port, :denied)
             reply(socket, 403, "Forbidden")
             {:close, state}
@@ -228,12 +249,20 @@ defmodule Managoat.Broker.Proxy do
       # handler's own close afterwards is a no-op on a closed port.
       case :ssl.handshake(socket.socket, client_ssl_options(state.certs, host), @head_timeout) do
         {:ok, client} ->
-          relay = spawn_link(fn -> pump(upstream, client) end)
-          result = serve(client, upstream, host, port, session, "")
+          # The relay owns the upstream socket's inbound side, so it can
+          # wait on origin bytes and on the descriptors `serve/6` sends it
+          # in one `receive`. It also owns every terminal event for a
+          # forwarded request, including the ones this connection never
+          # gets an answer to: `stop_relay/2` tells it why.
+          relay = spawn_link(fn -> relay(upstream, client, Response.new()) end)
+          :ok = :ssl.controlling_process(upstream, relay)
+          :ok = :ssl.setopts(upstream, active: :once)
+
+          reason = serve(client, upstream, host, port, session, relay, "")
+          stop_relay(relay, reason)
           :ssl.close(upstream)
-          Process.exit(relay, :kill)
           :ssl.close(client)
-          {result, state}
+          {:close, state}
 
         {:error, reason} ->
           Logger.info("broker: sandbox TLS handshake for #{host} failed: #{inspect(reason)}")
@@ -306,22 +335,80 @@ defmodule Managoat.Broker.Proxy do
 
   # Upstream → sandbox, byte for byte. When the origin closes, the sandbox's
   # side is closed too, which ends `serve/6`.
-  defp pump(upstream, client) do
-    case :ssl.recv(upstream, 0) do
-      {:ok, data} ->
+  # Origin → sandbox. Every byte is written to the sandbox the instant it
+  # arrives; only then are the same bytes shown to `Managoat.Broker.
+  # Response`, which says nothing about what to relay and only works out
+  # which request just ended, with what status. So framing cannot delay,
+  # reorder or buffer a body — a streaming reply streams exactly as it did
+  # before it was framed — and a framing failure costs telemetry rather
+  # than the response.
+  #
+  # The upstream socket is in `active: :once` here, which is what lets one
+  # `receive` serve both origin bytes and the descriptors `serve/7` sends.
+  defp relay(upstream, client, framer) do
+    receive do
+      {:expect, request} ->
+        relay(upstream, client, Response.expect(framer, request))
+
+      {:ssl, ^upstream, data} ->
+        :ssl.setopts(upstream, active: :once)
+
         case :ssl.send(client, data) do
-          :ok -> pump(upstream, client)
-          {:error, _} -> :ok
+          :ok ->
+            {framer, finished} = Response.observe(framer, data)
+            Enum.each(finished, &emit_finished/1)
+            relay(upstream, client, framer)
+
+          {:error, _} ->
+            finish_relay(framer, &Response.failed(&1, :client_closed))
         end
 
-      {:error, _} ->
+      {:ssl_closed, ^upstream} ->
         :ssl.close(client)
-        :ok
+        finish_relay(framer, &Response.closed/1)
+
+      {:ssl_error, ^upstream, _reason} ->
+        :ssl.close(client)
+        finish_relay(framer, &Response.failed(&1, :upstream_read_failed))
+
+      {:stop, from, ref, reason} ->
+        finish_relay(framer, &Response.failed(&1, reason))
+        send(from, {:relay_stopped, ref})
     end
   end
 
+  defp finish_relay(framer, fun) do
+    {_framer, finished} = fun.(framer)
+    Enum.each(finished, &emit_finished/1)
+    :ok
+  end
+
+  # The handler is leaving. Anything the relay is still holding never got
+  # its answer, and has to say so before the process goes away with the
+  # link. Bounded, because a terminal event is not worth hanging a
+  # connection teardown on.
+  defp stop_relay(relay, reason) do
+    # The monitor is not belt and braces: the relay ends itself when the
+    # origin closes, which is the common case, and waiting for a reply from
+    # a process that already finished would put the stop timeout on every
+    # ordinary teardown.
+    ref = Process.monitor(relay)
+    send(relay, {:stop, self(), ref, reason})
+
+    receive do
+      {:relay_stopped, ^ref} -> Process.demonitor(ref, [:flush])
+      {:DOWN, ^ref, :process, ^relay, _} -> :ok
+    after
+      @relay_stop_timeout -> Process.demonitor(ref, [:flush])
+    end
+
+    :ok
+  end
+
   # Sandbox → upstream, one request at a time: head rewritten, body copied.
-  defp serve(client, upstream, host, port, session, buffer) do
+  # Returns why the loop ended, which is the reason any request still
+  # awaiting a response gets.
+  defp serve(client, upstream, host, port, session, relay, buffer) do
     case HTTP.parse_request(buffer) do
       {:ok, head, rest} ->
         case Injector.inject(head.headers, host, port, head.target, session) do
@@ -329,33 +416,40 @@ defmodule Managoat.Broker.Proxy do
             # `head` is the target the client sent; `target` is the one to
             # forward. Telemetry is derived from the former, so a
             # substituted credential is never what gets logged.
-            log_request(session, head, host, {:ok, rule})
-            request = HTTP.encode_request(%{head | headers: headers}, target)
+            request = pending_request(session, head, host, {:ok, rule})
 
-            with :ok <- :ssl.send(upstream, request),
+            # Before the write, never after: an origin may answer faster
+            # than the next line of code runs.
+            send(relay, {:expect, request})
+
+            encoded = HTTP.encode_request(%{head | headers: headers}, target)
+
+            with :ok <- :ssl.send(upstream, encoded),
                  {:ok, rest} <- copy_body(client, upstream, HTTP.body_framing(head), rest) do
               if upgrade?(head),
                 do: pipe(client, upstream, rest),
-                else: serve(client, upstream, host, port, session, rest)
+                else: serve(client, upstream, host, port, session, relay, rest)
             else
-              {:error, _} -> :close
+              # The relay holds this request; it emits with the reason
+              # `stop_relay/2` passes on.
+              {:error, _} -> :upstream_send_failed
             end
 
           {:error, reason} ->
-            log_refused_request(session, head, host, reason)
+            refuse_request(session, head, host, reason)
             reply(client, 403, "Forbidden", [{"connection", "close"}])
-            :close
+            :client_closed
         end
 
       {:more, _} ->
         case :ssl.recv(client, 0, @idle_timeout) do
-          {:ok, data} -> serve(client, upstream, host, port, session, buffer <> data)
-          {:error, _} -> :close
+          {:ok, data} -> serve(client, upstream, host, port, session, relay, buffer <> data)
+          {:error, _} -> :client_closed
         end
 
       {:error, _} ->
         reply(client, 400, "Bad Request", [{"connection", "close"}])
-        :close
+        :client_closed
     end
   end
 
@@ -391,7 +485,7 @@ defmodule Managoat.Broker.Proxy do
          {:ok, data} <- :ssl.recv(client, 0, @idle_timeout) do
       pipe(client, upstream, data)
     else
-      _ -> :close
+      _ -> :client_closed
     end
   end
 
@@ -406,7 +500,6 @@ defmodule Managoat.Broker.Proxy do
            inject_or_deny(socket, head, host, port, target, session),
          {:ok, address} <- resolve(socket, host, port, state),
          {:ok, upstream} <- connect_plain(socket, address, host, port) do
-      log_request(session, head, host, {:ok, rule})
       connect_event(session, host, port, :ok)
 
       headers = [
@@ -414,11 +507,16 @@ defmodule Managoat.Broker.Proxy do
         | Enum.reject(headers, &(String.downcase(elem(&1, 0)) == "connection"))
       ]
 
-      :ok = :gen_tcp.send(upstream, HTTP.encode_request(%{head | headers: headers}, target))
+      # One request, so the framer here is a queue of one and the handler
+      # itself relays and frames; no second process to correlate with.
+      framer = Response.expect(Response.new(), pending_request(session, head, host, {:ok, rule}))
+      encoded = HTTP.encode_request(%{head | headers: headers}, target)
 
-      case copy_body_plain(socket, upstream, HTTP.body_framing(head), rest) do
-        :ok -> pump_plain(upstream, socket)
-        {:error, _} -> :ok
+      with :ok <- :gen_tcp.send(upstream, encoded),
+           :ok <- copy_body_plain(socket, upstream, HTTP.body_framing(head), rest) do
+        pump_plain(upstream, socket, framer)
+      else
+        {:error, _} -> finish_relay(framer, &Response.failed(&1, :upstream_send_failed))
       end
 
       :gen_tcp.close(upstream)
@@ -440,7 +538,7 @@ defmodule Managoat.Broker.Proxy do
         ok
 
       {:error, reason} ->
-        log_refused_request(session, head, host, reason)
+        refuse_request(session, head, host, reason)
         reply(socket, 403, "Forbidden")
         {:error, :denied}
     end
@@ -474,16 +572,29 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
-  defp pump_plain(upstream, client) do
+  # As in a tunnel: every byte reaches the sandbox first, and the same
+  # bytes are then shown to the framer, which only works out when the
+  # response ended. The loop still runs to the origin's close — the proxy
+  # sent `Connection: close`, so that is the end of the exchange — but the
+  # event fires when the body completes, not when the socket does.
+  defp pump_plain(upstream, client, framer) do
     case :gen_tcp.recv(upstream, 0, @idle_timeout) do
       {:ok, data} ->
         case Socket.send(client, data) do
-          :ok -> pump_plain(upstream, client)
-          {:error, _} -> :ok
+          :ok ->
+            {framer, finished} = Response.observe(framer, data)
+            Enum.each(finished, &emit_finished/1)
+            pump_plain(upstream, client, framer)
+
+          {:error, _} ->
+            finish_relay(framer, &Response.failed(&1, :client_closed))
         end
 
+      {:error, :closed} ->
+        finish_relay(framer, &Response.closed/1)
+
       {:error, _} ->
-        :ok
+        finish_relay(framer, &Response.failed(&1, :upstream_read_failed))
     end
   end
 
@@ -523,30 +634,32 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
-  # The request log: who sent what where, and what the proxy did about it.
-  # Never the headers, never a body. The host's handler writes the line.
-  defp log_request(%Session{meta: meta}, head, host, decision) do
+  # What the proxy knows about a request while it waits for the answer:
+  # everything the event will carry except the parts only the ending
+  # supplies. Never the headers, never a body.
+  defp pending_request(%Session{meta: meta}, head, host, decision) do
     {outcome, rule} =
       case decision do
         {:ok, nil} -> {:passthrough, nil}
         {:ok, rule} -> {:injected, rule}
-        {:error, :denied} -> {:denied, nil}
+        {:error, _} -> {:denied, nil}
       end
 
-    :telemetry.execute([:managoat, :broker, :request], %{count: 1}, %{
+    %{
       method: head.method,
       host: host,
       path: path_only(head),
       outcome: outcome,
       rule: rule,
-      meta: meta
-    })
+      meta: meta,
+      started_at: System.monotonic_time()
+    }
   end
 
-  # A request the injector refused. Both reasons are a `403` and a
-  # `:denied` event; they differ in who has to fix it, so the operator's
-  # one says so in a log line. The rule's name, never its credential.
-  defp log_refused_request(session, head, host, reason) do
+  # A request the proxy answered itself. There is no upstream response to
+  # wait for, so the event is terminal the moment the refusal is written,
+  # and it carries the status the proxy sent.
+  defp refuse_request(session, head, host, reason) do
     case reason do
       {:unsafe_credential, rule, surface} ->
         Logger.warning(
@@ -558,7 +671,32 @@ defmodule Managoat.Broker.Proxy do
         :ok
     end
 
-    log_request(session, head, host, {:error, :denied})
+    session
+    |> pending_request(head, host, {:error, :denied})
+    |> emit(403, nil)
+  end
+
+  defp emit_finished({request, status, error}), do: emit(request, status, error)
+
+  # The request log: who sent what where, what the proxy did about it, and
+  # how it ended. One event per request, on every terminal path, with a
+  # monotonic `duration` in native units beside `count` — a host converts
+  # it to whatever unit it stores.
+  defp emit(request, status, error) do
+    :telemetry.execute(
+      [:managoat, :broker, :request],
+      %{count: 1, duration: System.monotonic_time() - request.started_at},
+      %{
+        method: request.method,
+        host: request.host,
+        path: request.path,
+        outcome: request.outcome,
+        rule: request.rule,
+        status: status,
+        error: error,
+        meta: request.meta
+      }
+    )
   end
 
   # One event per connection the proxy decides about, whatever it decided,
