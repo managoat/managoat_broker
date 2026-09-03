@@ -10,6 +10,15 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-03
+
+### Changed
+
+- Raised the test coverage gate from 85% to 97% after adding behavioral
+  coverage for malformed HTTP, abandoned clients, partial request bodies,
+  unreachable plain-HTTP origins, listener defaults and incomplete
+  substitution rules.
+
 ## [0.1.0] - 2026-09-02
 
 ### Added

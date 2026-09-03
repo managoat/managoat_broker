@@ -51,6 +51,14 @@ defmodule Managoat.BrokerTest do
     refute Broker.port(a) == Broker.port(b)
   end
 
+  test "the default listener name works with the convenience API" do
+    start_supervised!({Broker, port: 0, store: Memory, ca_seed: @seed})
+
+    assert Broker.running?()
+    assert Broker.port() > 0
+    assert Broker.ca_pem() =~ "BEGIN CERTIFICATE"
+  end
+
   defp anchor(pem) do
     [{:Certificate, der, :not_encrypted}] = :public_key.pem_decode(pem)
     cert = X509.Certificate.from_der!(der)

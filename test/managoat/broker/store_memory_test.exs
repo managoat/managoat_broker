@@ -34,7 +34,7 @@ defmodule Managoat.Broker.Store.MemoryTest do
   end
 
   test "the default instance answers the one-argument callback" do
-    start_supervised!(Memory)
+    start_supervised!(%{id: Memory, start: {Memory, :start_link, []}})
     token = Memory.generate_token()
     :ok = Memory.put(token, %Session{})
 

@@ -32,6 +32,13 @@ defmodule Managoat.Broker.HTTPTest do
       assert {:ok, {"h.example", 80}, "/"} = HTTP.destination(head)
     end
 
+    test "only plain HTTP absolute-form targets are accepted outside a tunnel" do
+      {:ok, head, ""} =
+        HTTP.parse_request("GET https://h.example/x HTTP/1.1\r\nHost: h.example\r\n\r\n")
+
+      assert {:error, :bad_target} = HTTP.destination(head)
+    end
+
     test "an origin-form request inside a tunnel" do
       raw = "POST /repos HTTP/1.1\r\nHost: api.github.com\r\nContent-Length: 2\r\n\r\n{}"
 
@@ -48,6 +55,19 @@ defmodule Managoat.Broker.HTTPTest do
 
     test "garbage is an error" do
       assert {:error, _} = HTTP.parse_request("\x16\x03\x01 not http\r\n\r\n")
+    end
+
+    test "a response or malformed header is not accepted as a request" do
+      assert {:error, {:unexpected, {:http_response, {1, 1}, 200, "OK"}}} =
+               HTTP.parse_request("HTTP/1.1 200 OK\r\n\r\n")
+
+      assert {:error, {:bad_header, _}} =
+               HTTP.parse_request("GET / HTTP/1.1\r\n\x00bad\r\n\r\n")
+    end
+
+    test "the asterisk request-target is preserved" do
+      assert {:ok, %{method: "OPTIONS", target: "*"}, ""} =
+               HTTP.parse_request("OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n")
     end
 
     test "a bad CONNECT authority" do
