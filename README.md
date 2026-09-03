@@ -315,6 +315,30 @@ or from the protocol; it cannot be measured.
   and the connection is then torn down. Agent Vault ends the same way, by
   aborting mid-stream.
 
+- **One request-read deadline rather than Agent Vault's timeout matrix.**
+  Agent Vault set `ReadHeaderTimeout` (10s), `ReadTimeout` (60s),
+  `WriteTimeout` (30 min) and `IdleTimeout` (2 min) on the server inside
+  the tunnel, and `TLSHandshakeTimeout` (10s), `ResponseHeaderTimeout` (5
+  min) and `IdleConnTimeout` (90s) on the upstream transport.
+
+  Here the head is bounded at 30s, the gap between reads at 300s, the
+  upstream dial at 10s, and one whole request read — head plus body — by
+  `request_read_timeout`, which defaults to five minutes and is the only
+  one of them a host can name. That last is the one that closes the
+  connection-occupancy hole: the others are per operation, so a client
+  sending one byte at a time never trips any of them, and the byte cap
+  bounds volume rather than time.
+
+  The response side is deliberately not bounded, which is where this
+  differs. A stalled origin is bounded only indirectly on the absolute-form
+  path (by the 300s gap between reads) and not at all inside a tunnel,
+  where the relay waits on origin bytes with no deadline. Agent Vault's
+  `ResponseHeaderTimeout` is the thing we lack, and adding it means a
+  per-request timer in the relay rather than a timeout argument. Nothing
+  has needed it: a stalled origin costs a socket, and the sandbox's own
+  client gives up on its own. If that stops being true it gets its own
+  issue.
+
 - **No body substitution.** The `:substitute` rule reaches header values
   and the request target — a placeholder in a path (`/bot<token>/send`) or
   a query (`?key=<token>`) is replaced on both request paths — but a

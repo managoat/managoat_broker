@@ -262,7 +262,7 @@ defmodule Managoat.Broker.ProxyCase do
          upstream_ssl_options: [
            cacerts: [X509.Certificate.to_der(origin_ca) | Keyword.get(opts, :extra_cacerts, [])]
          ]
-       ]}
+       ] ++ Keyword.take(opts, [:request_read_timeout])}
     )
 
     %{

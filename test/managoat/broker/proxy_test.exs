@@ -634,6 +634,27 @@ defmodule Managoat.Broker.ProxyTest do
       end)
     end
 
+    test "a declared body of zero bytes leaves nothing behind, so the tunnel survives", ctx do
+      # `Content-Length: 0` is a body, and is no bytes: there is nothing in
+      # the stream for the next head to be read out of the middle of.
+      tls = tunnel(ctx, ctx.token)
+
+      capture_log(fn ->
+        :ok =
+          :ssl.send(
+            tls,
+            "POST /empty HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+          )
+
+        reply = recv_until(tls, "\r\n\r\n")
+        assert reply =~ "HTTP/1.1 502"
+        refute reply =~ "connection: close"
+
+        :ok = :ssl.send(tls, "GET /next HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        assert recv_until(tls, "\r\n\r\n") =~ "HTTP/1.1 502"
+      end)
+    end
+
     test "is 502 over absolute-form plain HTTP too", ctx do
       {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
 

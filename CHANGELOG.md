@@ -10,6 +10,67 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-03
+
+A wall-clock bound on reading one request, which is what actually closes
+the connection-occupancy hole 0.6.0 claimed the byte cap closed.
+
+### Added
+
+- **`request_read_timeout`**, defaulting to **five minutes**: the wall
+  clock the proxy will spend reading one request, head and body, starting
+  with that request's first byte. A read that would outlast it is cut
+  short; where the origin has been told nothing yet the client gets `408`,
+  and where the head has already been forwarded the connection ends
+  without a reply, because the origin already holds a partial body — the
+  same choice the request cap makes for a chunked body that passes it
+  while streaming. Either way one terminal event, with
+  `error: :request_timeout`. Closes #20.
+
+  It is the only timeout here a host can name, and the reason is that it
+  is the only one that can refuse a *valid* request: a large upload over a
+  slow link is legitimate and slow. `:infinity` turns it off.
+
+  The response side is deliberately outside it. A `git clone` or an SSE
+  stream runs long on the way back, which is the traffic this proxy exists
+  for, and the existing streaming tests show a long response is unaffected.
+  WebSocket frames after an upgrade are outside it too: they are no longer
+  a request being read.
+
+### Fixed
+
+- **A correction to 0.6.0.** That release's changelog said of the request
+  byte cap: "bodies are read with a five-minute idle timeout per read, so
+  an authenticated client sending one byte every four minutes held a
+  connection open indefinitely. A byte cap bounds that; the idle timeout
+  alone did not."
+
+  That overstates what the byte cap does. `@idle_timeout` is per `recv`,
+  so a client sending one byte every four minutes never trips it, and at
+  that rate the default 1 GiB cap is reached in roughly **eight thousand
+  years**. The cap bounds volume, not time; the connection-occupancy hole
+  stayed open until this release. The availability argument for the byte
+  cap stands on its own — a single request is not allowed to be
+  arbitrarily large — but it was never the bound on how long one could
+  take.
+
+### Decided, and unchanged
+
+- **The gap between requests and the gap between body chunks stay the same
+  300s.** Agent Vault used 2 minutes and 60 seconds. Splitting them would
+  change *when* a stalled request dies, not whether, now that a deadline
+  bounds the whole read; a connection held open between requests is doing
+  what a proxy connection is for.
+
+- **No upstream response-header timeout.** Agent Vault had one at 5
+  minutes. A stalled origin is bounded here only indirectly on the
+  absolute-form path and not at all inside a tunnel, where the relay waits
+  on origin bytes with no deadline; closing that needs a per-request timer
+  in the relay rather than a timeout argument, and it is the response side,
+  where long is legitimate. Recorded in README.md's deviations rather than
+  built. Nothing has needed it: a stalled origin costs a socket, and the
+  sandbox's own client gives up on its own.
+
 ## [0.7.0] - 2026-09-03
 
 Rule matching is by specificity rather than declaration order. A host whose
