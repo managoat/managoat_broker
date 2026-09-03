@@ -30,6 +30,11 @@ defmodule Managoat.Broker.HTTP do
   """
   @type framing :: :none | {:length, non_neg_integer()} | :chunked | :until_close
 
+  # Everything up to and including the space is a control character or the
+  # space itself; `\x7f` is DEL. The rest are the characters that change
+  # what something downstream reads the name as — see `valid_host?/1`.
+  @bad_in_host ~r/[\x00-\x20\x7f@\/\\?#%]/
+
   @doc """
   Parse a request head off the front of `buffer`. `{:more, buffer}` when the
   head is not complete yet, `{:ok, head, rest}` with the bytes after the
@@ -187,11 +192,16 @@ defmodule Managoat.Broker.HTTP do
   `GET http://[::1]:8080/x` — since without brackets there is no telling
   which colon separates the port. The host is returned unbracketed, which
   is what a rule matches and what a certificate has to cover.
+
+  A host that fails `valid_host?/1` is `{:error, :bad_target}` here, which
+  is the proxy's `400`, before it can be resolved, dialed, cached or
+  written into a certificate.
   """
   @spec destination(head()) ::
           {:ok, {String.t(), :inet.port_number()}, String.t()} | {:error, :bad_target}
   def destination(%{method: "CONNECT", target: target}) do
     with {:ok, host, port} <- split_authority(target),
+         true <- valid_host?(host),
          {p, ""} when p in 1..65_535 <- Integer.parse(port) do
       {:ok, {host, p}, target}
     else
@@ -200,18 +210,50 @@ defmodule Managoat.Broker.HTTP do
   end
 
   def destination(%{target: "http://" <> _ = target}) do
-    case URI.parse(target) do
-      %URI{host: host, port: port} = uri when is_binary(host) ->
-        path = if uri.path in [nil, ""], do: "/", else: uri.path
-        query = if uri.query, do: "?" <> uri.query, else: ""
-        {:ok, {host, port || 80}, path <> query}
-
-      _ ->
-        {:error, :bad_target}
+    with %URI{host: host, port: port} = uri <- URI.parse(target),
+         true <- valid_host?(host) do
+      path = if uri.path in [nil, ""], do: "/", else: uri.path
+      query = if uri.query, do: "?" <> uri.query, else: ""
+      {:ok, {host, port || 80}, path <> query}
+    else
+      _ -> {:error, :bad_target}
     end
   end
 
   def destination(_), do: {:error, :bad_target}
+
+  @doc """
+  Is this a host the proxy will act on?
+
+  The name comes off a sandbox's own request line and reaches
+  `:inet.getaddrs`, the TLS `server_name_indication`, the leaf cache's key
+  and **the subject and SAN of a certificate this proxy signs**. A `/` in it
+  ends the relative distinguished name the leaf's subject is built from; an
+  `@` reads as userinfo to something downstream that parses a URL out of it
+  again; whitespace and control characters end a field. None of them belong
+  in a host, so a request naming one is refused rather than sanitised —
+  sanitising would forward a name the client did not ask for.
+
+  So a host is at most 253 bytes (DNS's own limit), is not empty, does not
+  begin or end with a dot, and holds no control character, whitespace, or
+  any of `@ / \\ ? # %`. This is Agent Vault's `brokercore.IsValidHost`
+  less its DNS-name blocklist (`localhost`, `metadata.google.internal` and
+  two others), which is not worth porting: the SSRF guard here works on the
+  addresses a name *resolves to*, so it catches every name that reaches a
+  blocked range rather than the four anyone thought to write down.
+
+  An unbracketed IPv6 literal passes, because that is how `destination/1`
+  hands one over once the brackets have said where the host ended.
+  """
+  @spec valid_host?(term()) :: boolean()
+  def valid_host?(host) when is_binary(host) do
+    byte_size(host) in 1..253 and
+      not String.starts_with?(host, ".") and
+      not String.ends_with?(host, ".") and
+      not String.match?(host, @bad_in_host)
+  end
+
+  def valid_host?(_host), do: false
 
   # `host:port`, or `[v6]:port` — an IPv6 literal is bracketed precisely
   # because it is full of colons, so the brackets are what say which colon

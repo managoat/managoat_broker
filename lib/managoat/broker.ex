@@ -46,6 +46,7 @@ defmodule Managoat.Broker do
   | `max_request_bytes` | default 1 GiB. The largest request body the proxy will forward; `:infinity` for none |
   | `max_response_bytes` | default `:infinity`. The largest response body the proxy will relay |
   | `request_read_timeout` | default 5 minutes, in milliseconds. The wall clock the proxy will spend reading one request, head and body; `:infinity` for none. It does not bound the response |
+  | `max_cached_leaves` | default 1024. How many signed per-host leaves the listener caches before evicting the least recently used |
   | `name` | default `Managoat.Broker`. The supervisor's name; `port/1`, `running?/1` and `ca_pem/1` take it |
 
   The root certificate the sandbox must trust is `ca_pem/1` once the
@@ -87,7 +88,7 @@ defmodule Managoat.Broker do
   @impl Supervisor
   def init(opts) do
     name = Keyword.get(opts, :name, __MODULE__)
-    certs = Certs.new(Keyword.fetch!(opts, :ca_seed))
+    certs = certs(opts)
     :persistent_term.put({__MODULE__, name, :certs}, certs)
 
     listener = %{
@@ -119,6 +120,18 @@ defmodule Managoat.Broker do
     }
 
     Supervisor.init([listener], strategy: :one_for_one)
+  end
+
+  # `max_cached_leaves` is passed through rather than defaulted here: the
+  # default belongs beside the cache it bounds, in `Managoat.Broker.Certs`,
+  # and a default in two places is one that disagrees with itself one day.
+  defp certs(opts) do
+    seed = Keyword.fetch!(opts, :ca_seed)
+
+    case Keyword.fetch(opts, :max_cached_leaves) do
+      {:ok, max} -> Certs.new(seed, max)
+      :error -> Certs.new(seed)
+    end
   end
 
   @doc "True when the listener under `name` is up on this node."

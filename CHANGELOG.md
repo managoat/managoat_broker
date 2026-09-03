@@ -10,6 +10,58 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-03
+
+The leaf cache is bounded, and a host is validated before it can become a
+cache key or a certificate subject. Closes #21.
+
+### Fixed
+
+- **The leaf certificate cache no longer grows without limit.** It held one
+  signed leaf per distinct host ever tunnelled, refreshed after
+  twenty-nine days but never removed, for the life of the listener. Its key
+  is the host from a sandbox's own `CONNECT` line, so what it held was
+  chosen by the sandbox: under `:passthrough` an agent browses wherever it
+  likes, and a wildcard DNS record aimed at one address makes every
+  `*.attacker.example` a distinct name that resolves, connects and is
+  cached. Nothing dramatic — entries are small and signing is milliseconds
+  — but unbounded growth driven by an untrusted input is the shape worth
+  fixing before it matters.
+
+  It now holds at most **`max_cached_leaves`** (default **1024**) and
+  evicts the **least recently used**. A leaf is marked used on every hit,
+  so a host still being visited keeps its leaf across evictions of others
+  and a busy listener does not become a re-signing treadmill. Going over
+  the cap refuses nothing: a host that fell off costs one ECDSA signature
+  the next time it is seen, which is what the cache was saving in the first
+  place.
+
+### Added
+
+- **`Managoat.Broker.HTTP.valid_host?/1`, enforced by `destination/1`.** A
+  host from a request line reaches `:inet.getaddrs`, the TLS
+  `server_name_indication`, the leaf cache's key and **the subject and SAN
+  of a certificate this proxy signs** — a `/` ends the relative
+  distinguished name a leaf's subject is built from, and an `@` reads as
+  userinfo to anything that parses a URL out of the name again.
+
+  So a host longer than 253 bytes, or empty, or beginning or ending with a
+  dot, or holding a control character, whitespace or any of `@ / \ ? # %`
+  is now **`400`**, on both request paths, before it is resolved, dialed,
+  cached or signed. It is refused rather than sanitised: forwarding a name
+  the client did not ask for is worse than refusing the one it did.
+
+  This is Agent Vault's `brokercore.IsValidHost` less its DNS-name
+  blocklist (`localhost`, `kubernetes.default`,
+  `metadata.google.internal`, `instance-data`), which is deliberately not
+  ported: the SSRF guard here works on the addresses a name *resolves to*,
+  so it catches every name that reaches a blocked range rather than the
+  four anyone thought to write down.
+
+- **`max_cached_leaves`** on the listener, and
+  `Managoat.Broker.Certs.cached_leaves/1` to see what the cache is holding.
+  `Certs.new/2` takes the cap; `new/1` still means the default.
+
 ## [0.8.0] - 2026-09-03
 
 A wall-clock bound on reading one request, which is what actually closes

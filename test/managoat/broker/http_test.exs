@@ -79,6 +79,59 @@ defmodule Managoat.Broker.HTTPTest do
     end
   end
 
+  describe "valid_host?/1" do
+    test "an ordinary name, an address and a bracketed literal's host all pass" do
+      for good <- ["localhost", "api.github.com", "UPPER.Example.com", "127.0.0.1", "::1"] do
+        assert HTTP.valid_host?(good), "#{good} was rejected"
+      end
+    end
+
+    test "the characters that change what something downstream reads" do
+      # Each of these reaches `:inet.getaddrs`, SNI, the leaf cache's key
+      # and the subject of a certificate this proxy signs. `/` ends the
+      # relative distinguished name a leaf's subject is built from.
+      for bad <- ["a@b.example", "a/b.example", "a\\b.example", "a?b", "a#b", "a%2fb"] do
+        refute HTTP.valid_host?(bad), "#{inspect(bad)} was accepted"
+      end
+    end
+
+    test "whitespace and control characters" do
+      for bad <- ["a b.example", "a\tb.example", "a\rb", "a\nb", "a\0b", "a\x7fb"] do
+        refute HTTP.valid_host?(bad), "#{inspect(bad)} was accepted"
+      end
+    end
+
+    test "length, emptiness and a leading or trailing dot" do
+      refute HTTP.valid_host?("")
+      refute HTTP.valid_host?(String.duplicate("a", 254))
+      assert HTTP.valid_host?(String.duplicate("a", 253))
+      refute HTTP.valid_host?(".example.com")
+      refute HTTP.valid_host?("example.com.")
+    end
+
+    test "anything that is not a binary is not a host" do
+      refute HTTP.valid_host?(nil)
+      refute HTTP.valid_host?(:localhost)
+    end
+  end
+
+  describe "destination/1 refuses a host it will not act on" do
+    test "on a CONNECT authority" do
+      {:ok, head, _} = HTTP.parse_request("CONNECT evil@h.example:443 HTTP/1.1\r\n\r\n")
+      assert {:error, :bad_target} = HTTP.destination(head)
+
+      {:ok, head, _} = HTTP.parse_request("CONNECT .h.example:443 HTTP/1.1\r\n\r\n")
+      assert {:error, :bad_target} = HTTP.destination(head)
+    end
+
+    test "on an absolute-form target" do
+      {:ok, head, _} =
+        HTTP.parse_request("GET http://h.example./x HTTP/1.1\r\nHost: h.example.\r\n\r\n")
+
+      assert {:error, :bad_target} = HTTP.destination(head)
+    end
+  end
+
   test "encode_request round-trips a head with the target substituted" do
     {:ok, head, _} = HTTP.parse_request("GET http://h/p HTTP/1.1\r\nHost: h\r\nX: y\r\n\r\n")
 
