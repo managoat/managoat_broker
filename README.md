@@ -213,26 +213,76 @@ than a path, and is reported as it was sent.
 
 This proxy replaced Infisical's Agent Vault behind the same interface. The
 parity suite (`test/managoat/broker/agent_vault_parity_test.exs`) replays
-the upstream tests it stands in for and lists what was not ported. In
-short:
+the upstream tests it stands in for and lists what was not ported.
 
-- **Absolute-form (plain HTTP) is one request per connection.** The proxy
-  adds `Connection: close` upstream and closes after the response. HTTPS
-  tunnels keep-alive normally. Plain HTTP through the proxy is apt and
-  little else.
-- **No body substitution.** The `:substitute` rule reaches header values
-  and the request target — a placeholder in a path (`/bot<token>/send`) or
-  a query (`?key=<token>`) is replaced on both the CONNECT and the
-  absolute-form path — but a request body is forwarded as bytes.
-- **No WebSocket frame rewriting.** The upgrade request is injected; the
-  frames after it are piped as bytes.
-- **No auth-failure rate limiting** on the proxy port.
-- **No body-size caps** (Agent Vault's response cap was unlimited by
-  default too).
+Each of these is a decision rather than a backlog item. Agent Vault is
+deleted from the cluster and from Fountain's codebase, so the A/B that
+settled the last round — the same request against both proxies, compared
+on the wire — no longer exists. A row reopened here has to be argued from
+the upstream tests in the parity suite, from Agent Vault v0.39.1's source,
+or from the protocol; it cannot be measured.
+
+### Deliberate, and expected to stay that way
+
+- **No auth-failure rate limiting on the proxy port.** Agent Vault had
+  one, and **having it caused a production incident**: the limiter counted
+  per source address, every sandbox behind one NAT egress shared an
+  address, and one misconfigured client locked out unrelated tenants. Not
+  having it is the fix, not the gap.
+
+  The assumption that replaces it is operational, and a host has to hold
+  up its end: **the listener is reachable only through the intended
+  ingress or network boundary.** If that ever stops being true, the answer
+  is not to restore the limiter as it was — it is to key one on something
+  better than the peer address.
+
 - **The label half of the proxy credential is not checked.** Agent Vault
   refused a valid token presented with another vault's name. Here the
-  random per-session token is the whole binding; the label exists because
-  some clients (git) refuse a proxy URL with a user and no password.
+  per-session token is random and is the whole binding, so checking the
+  label would add no authority — there is nothing a wrong label could
+  protect. The label exists only because some clients (git) refuse a proxy
+  URL with a username and no password.
+
+- **No WebSocket frame rewriting.** The upgrade request is injected like
+  any other; the frames after it are piped as bytes. Rewriting them is
+  possible without buffering a whole WebSocket, but it replaces a byte
+  pipe with a protocol implementation that has to get masking,
+  fragmentation, control-frame interleaving and negotiated compression
+  right before a substitution is even correct. Nothing sends a credential
+  inside a frame today. The simple byte pipe is worth keeping until
+  something does.
+
+- **No response-body cap.** Not a parity gap: Agent Vault's response cap
+  was unlimited by default, so there is nothing to match. A cap would be
+  new protection and would need justifying on its own terms, not as
+  parity.
+
+### Deliberate for now, with a condition attached
+
+- **Absolute-form (plain HTTP) is one request per connection.** The proxy
+  adds `Connection: close` upstream and closes after the response; HTTPS
+  tunnels keep-alive normally.
+
+  Supporting client keep-alive is not just dropping that header:
+  successive absolute-form requests on one proxy connection may name
+  different origins, so auth and session reuse have to stay well-defined,
+  and finding the response boundary safely needs the response framing that
+  now exists. The traffic is apt and little else, and no consumer needs
+  it. If one does, it gets its own issue and its own acceptance tests
+  rather than riding along with something else.
+
+- **No request-body cap.** This one *is* a real parity gap and is named as
+  such: Agent Vault v0.39.1 capped request bodies at 1 GiB by default.
+  This proxy streams request bodies rather than materialising them, so the
+  memory-exhaustion rationale is weaker — but an authenticated client can
+  still occupy a connection indefinitely. It stays deferred until that
+  protection is actually wanted; it is not described as parity in the
+  meantime.
+
+- **No body substitution.** The `:substitute` rule reaches header values
+  and the request target — a placeholder in a path (`/bot<token>/send`) or
+  a query (`?key=<token>`) is replaced on both request paths — but a
+  request body is forwarded as bytes.
 
 ## Two operational traps a host must handle
 

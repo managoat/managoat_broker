@@ -247,20 +247,57 @@ defmodule Managoat.Broker.AgentVaultParityTest do
     assert System.convert_time_unit(duration, :native, :millisecond) >= 0
   end
 
-  # Not ported, on purpose:
+  # Not ported, and each one a decision rather than a backlog item. Agent
+  # Vault is deleted from the cluster and from Fountain's codebase, so the
+  # A/B that settled the last round — the same request against both
+  # proxies, compared on the wire — no longer exists. Reopening a row here
+  # means arguing it from the upstream tests above, from v0.39.1's source
+  # or from the protocol, because it can no longer be measured. README.md's
+  # "Deviations from Agent Vault" is the prose version.
+  #
+  # Expected to stay divergent:
+  #
+  # - TestMITM*RateLimit* (auth-failure rate limiting on the proxy port).
+  #   Having one caused a production incident: it counted per source
+  #   address, every sandbox behind one NAT egress shared an address, and
+  #   one misconfigured client locked out unrelated tenants. Not having it
+  #   is the fix. What replaces it is an operational assumption the host
+  #   holds up — the listener is reachable only through the intended
+  #   ingress — and if that stops being true the answer is a limiter keyed
+  #   on something better than the peer address, not this one back.
+  # - TestMITMVaultHintMismatch: Agent Vault refused a valid token
+  #   presented with another vault's name. Here the token is random and is
+  #   the whole binding, so the label half of the proxy credential is not
+  #   consulted and there is no mismatch to test; the label exists only
+  #   because some clients (git) refuse a proxy URL with a user and no
+  #   password. proxy_test.exs asserts the label is ignored.
+  # - TestCopyWSFrames* (credential substitution inside WebSocket frames).
+  #   Rewriting frames replaces a byte pipe with a protocol implementation
+  #   that has to get masking, fragmentation, control-frame interleaving
+  #   and negotiated compression right before a substitution is correct,
+  #   and nothing sends a credential inside a frame today.
+  # - TestResponseLimit* (response-body cap): not a parity gap at all.
+  #   Agent Vault's response cap was unlimited by default, so there is
+  #   nothing to match; a cap would be new protection on its own terms.
+  # - TestMITMPortBasedRouting, TestMITMAmbiguousAgentVault: Agent Vault's
+  #   multi-vault selection, which a per-conversation token makes moot.
+  #
+  # Divergent for now, with a condition attached:
+  #
+  # - Plain-HTTP client keep-alive. `forward_plain/8` sends `Connection:
+  #   close` upstream and closes after the response. Supporting keep-alive
+  #   is not just dropping that header: successive absolute-form requests
+  #   on one connection may name different origins, so auth and session
+  #   reuse must stay well-defined. No consumer needs it; if one does it
+  #   gets its own issue and acceptance tests.
+  # - TestRequestBodyCap* (request-body cap). This one *is* a real parity
+  #   gap: v0.39.1 capped request bodies at 1 GiB by default. This proxy
+  #   streams request bodies rather than materialising them, so the
+  #   memory-exhaustion rationale is weaker, but an authenticated client
+  #   can still occupy a connection indefinitely. Deferred until that
+  #   protection is wanted, and not called parity in the meantime.
   # - TestMITMSubstitutionBody (placeholder rewriting inside a request
   #   body): the `:substitute` rule reaches header values and the request
   #   target, so a credential in a header, a path or a query is brokered,
   #   but a body is still forwarded as bytes.
-  # - TestCopyWSFrames* (credential substitution inside WebSocket frames).
-  # - TestMITM*RateLimit* (auth-failure rate limiting on the proxy port).
-  # - TestResponseLimit* / TestRequestBodyCap* (body size caps; Agent Vault's
-  #   response cap was unlimited by default too).
-  # - TestMITMPortBasedRouting, TestMITMAmbiguousAgentVault: Agent Vault's
-  #   multi-vault selection, which a per-conversation token makes moot.
-  # - TestMITMVaultHintMismatch: Agent Vault refused a valid token presented
-  #   with another vault's name. Here the token is the whole binding and the
-  #   label half of the proxy credential is not consulted (the store's
-  #   moduledoc says why it exists at all), so there is no mismatch to test;
-  #   proxy_test.exs asserts the label is ignored.
 end
