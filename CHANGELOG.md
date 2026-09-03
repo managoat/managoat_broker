@@ -10,6 +10,42 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-03
+
+### Changed
+
+- **`:substitute` placeholders are validated, and a rule with an unusable
+  one is refused.** A placeholder must be at least four characters, hold a
+  letter or digit, and carry a boundary — `__` at either end, or a
+  character outside `[A-Za-z0-9_]`. A matched rule that fails this gets
+  `403` and a `:warning` naming the rule, never the credential. Closes #11.
+
+  Substitution is a literal find-and-replace, and 0.2.0 extended it from
+  header values to the request target — which is what makes this worth
+  enforcing rather than documenting. A rule declaring `placeholder: "id"`
+  silently rewrote every `id` in every matching path; the credential landed
+  somewhere nobody chose and nothing raised. Agent Vault validates for the
+  same reason, its comment naming `account_sid` as the case: a real field
+  name that legitimately appears in URL path segments.
+
+  **This can refuse traffic that previously succeeded**, which is the
+  point. A host on a short placeholder should rename it before upgrading.
+  `Managoat.Broker.Injector.valid_placeholder?/1` is public so a session
+  can be checked where it is built rather than on every request it matches.
+
+  An empty placeholder used to be ignored silently, leaving the request
+  untouched; it is now refused like any other unusable one.
+
+- A `:substitute` rule with a valid placeholder and no credential still
+  forwards the placeholder as written, unchanged from before. That is the
+  same choice `:custom` makes for an unfilled `{{ KEY }}`: the origin
+  refuses a placeholder, which is a clearer failure than a credential sent
+  empty.
+
+### Added
+
+- `Managoat.Broker.Injector.valid_placeholder?/1`.
+
 ## [0.4.0] - 2026-09-03
 
 IPv6 upstreams. Row 3 of #5. This is a minor bump because the SSRF guard's

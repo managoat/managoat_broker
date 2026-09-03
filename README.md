@@ -121,6 +121,15 @@ segment, where `:` is legal unencoded and `%3A` is a different URL. A
 credential holding a control character or a space would split the request
 line, so it is refused with `403` rather than written into a target.
 
+A placeholder must be distinctive enough to be one: four characters or
+more, holding a letter or digit, and carrying a boundary — `__` at either
+end, or a character outside `[A-Za-z0-9_]`. Substitution is a literal
+find-and-replace, so `id` would rewrite every `id` in a path and
+`account_sid` is a real field name that appears in URLs.
+`Managoat.Broker.Injector.valid_placeholder?/1` is the check; call it when
+building a session, so a bad rule fails where it is written rather than on
+every request it would have matched.
+
 Rules match against the target the client sent, and telemetry is derived
 from that same original, so a placeholder in a path is logged as the
 placeholder and one in a query is not logged at all.
