@@ -124,6 +124,27 @@ defmodule Managoat.Broker.ProxyTest do
     assert reply =~ "HTTP/1.1 400"
   end
 
+  test "a host the proxy will not act on is 400 before anything is resolved or signed", ctx do
+    # The name reaches `:inet.getaddrs`, SNI, the leaf cache's key and the
+    # subject of a certificate this proxy signs, so it is checked before any
+    # of that rather than sanitised on the way past.
+    for authority <- ["evil@localhost:#{ctx.https_port}", ".localhost:#{ctx.https_port}"] do
+      {_tcp, reply} = connect(ctx, authority, proxy_auth(ctx.token))
+      assert reply =~ "HTTP/1.1 400", "#{authority} was not refused"
+    end
+
+    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+    :ok =
+      :gen_tcp.send(
+        tcp,
+        "GET http://localhost./x HTTP/1.1\r\nHost: localhost.\r\n" <>
+          "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
+      )
+
+    assert read_until_closed(tcp) =~ "HTTP/1.1 400"
+  end
+
   test "an abandoned connection does not affect the listener", ctx do
     {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
     :ok = :gen_tcp.close(tcp)

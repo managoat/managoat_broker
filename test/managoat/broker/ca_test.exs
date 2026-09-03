@@ -64,5 +64,46 @@ defmodule Managoat.Broker.CATest do
       assert {:ok, _} =
                :public_key.pkix_path_validation(Certs.ca_der(table), [first[:cert]], [])
     end
+
+    test "holds at most max_leaves, and the least recently used goes first" do
+      # The key is the host from a sandbox's own CONNECT line, so what the
+      # cache holds is chosen by the sandbox: a wildcard DNS record aimed at
+      # one address makes every `*.attacker.example` a distinct entry.
+      table = Certs.new(@seed, 3)
+      assert Certs.cached_leaves(table) == 0
+
+      a = Certs.for_host(table, "a.example")
+      b = Certs.for_host(table, "b.example")
+      c = Certs.for_host(table, "c.example")
+      assert Certs.cached_leaves(table) == 3
+
+      # `a` is used again, so the least recently used is now `b`.
+      assert Certs.for_host(table, "a.example") == a
+
+      d = Certs.for_host(table, "d.example")
+      assert Certs.cached_leaves(table) == 3
+
+      # A host still in use keeps its leaf across evictions of others: the
+      # cache is not a re-signing treadmill.
+      assert Certs.for_host(table, "a.example") == a
+      assert Certs.for_host(table, "c.example") == c
+      assert Certs.for_host(table, "d.example") == d
+
+      # `b` went, so it comes back as a newly signed leaf. Last, because
+      # signing it evicts whatever is least recently used by then.
+      refute Certs.for_host(table, "b.example") == b
+    end
+
+    test "a flood of distinct hosts stops at the cap" do
+      table = Certs.new(@seed, 8)
+
+      for i <- 1..40, do: Certs.for_host(table, "h#{i}.attacker.example")
+
+      assert Certs.cached_leaves(table) == 8
+
+      # And the root is still there to sign with, which the leaf count is
+      # deliberately not counting.
+      assert Certs.ca_pem(table) =~ "BEGIN CERTIFICATE"
+    end
   end
 end

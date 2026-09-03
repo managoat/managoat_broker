@@ -160,8 +160,9 @@ placeholder and one in a query is not logged at all.
 allow_private_upstreams: false}`. Every option but the last is required,
 and a missing one raises at start naming the option. Optional:
 `upstream_ssl_options` (merged over the `:ssl` options the proxy dials
-origins with; a test origin's `cacerts`) and `name` (default
-`Managoat.Broker`, for several listeners in one VM). There is no
+origins with; a test origin's `cacerts`), `max_cached_leaves` (default
+1024; see [The CA](#the-ca)) and `name` (default `Managoat.Broker`, for
+several listeners in one VM). There is no
 configuration module reading an otp_app: the listener is started by the
 host with values the host computed at boot, and a library that is not
 started serves nothing.
@@ -191,6 +192,31 @@ for anything else: derive it from a master key with a fixed info string,
 so the CA key is never the storage key. Leaves live thirty days, are cached
 per host in an ETS table the listener owns, and are re-signed after
 twenty-nine.
+
+That cache is **bounded**, because its key is the host from a sandbox's own
+`CONNECT` line: under `:passthrough` an agent browses wherever it likes,
+and a wildcard DNS record aimed at one address makes every
+`*.attacker.example` a distinct name that resolves, connects and would
+otherwise be cached for the life of the listener. It holds at most
+`max_cached_leaves` of them — **1024** by default — and the least recently
+used goes first, so a host still being visited keeps its leaf and a busy
+listener does not become a re-signing treadmill. Going over the cap costs
+one ECDSA signature the next time a fallen-off host is seen; it refuses
+nothing, which is why it is an option with a default rather than a decision
+the host has to make.
+
+A host is validated before any of that. The name off the request line
+reaches `:inet.getaddrs`, the TLS `server_name_indication`, that cache's
+key and the subject and SAN of a certificate this proxy signs, so a host
+longer than 253 bytes, or holding a control character, whitespace or any of
+`@ / \ ? # %`, or beginning or ending with a dot, is **`400`** before it is
+resolved, dialed, cached or signed. It is not sanitised: forwarding a name
+the client did not ask for is worse than refusing the one it did. This is
+Agent Vault's `brokercore.IsValidHost` less its DNS-name blocklist
+(`localhost`, `metadata.google.internal` and two more), which is not worth
+porting — the SSRF guard above works on the addresses a name *resolves to*,
+so it catches every name that reaches a blocked range rather than the four
+anyone thought to write down.
 
 ## Telemetry
 
