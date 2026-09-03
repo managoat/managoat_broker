@@ -10,6 +10,20 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-03
+
+### Added
+
+- `Managoat.Broker.Proxy.addresses/1`, the other half of the guard that
+  `blocked/1` was already the public face of: every address a host
+  resolves to, in the order the proxy would dial them.
+  `blocked(addresses(host))` empty is the whole check.
+
+  It was private, which left the A∪AAAA union — added in 0.4.0 — with no
+  direct test. If the two lookups had been transposed the union would have
+  been identical and only the dial preference would have changed, silently
+  and on every host. Closes #14.
+
 ## [0.6.0] - 2026-09-03
 
 Body size limits. Closes #12, and with it the last real Agent Vault parity
