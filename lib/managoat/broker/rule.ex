@@ -35,6 +35,17 @@ defmodule Managoat.Broker.Rule do
   and `?key=<token>` are brokered — but never a request body, which is one
   of the deviations from Agent Vault the README lists.
 
+  A placeholder has to be *distinctive enough to be one*: at least four
+  characters, holding a letter or digit, and carrying a boundary — `__` at
+  either end, or a character outside `[A-Za-z0-9_]`. Substitution is a
+  literal find-and-replace, so `"id"` would rewrite every `id` in every
+  matching path and `"account_sid"` is a real field name that appears in
+  URLs; the credential would land somewhere nobody chose, and nothing would
+  raise. `Managoat.Broker.Injector.valid_placeholder?/1` is the check, and
+  a host should call it when it builds a session so a bad rule fails where
+  it is written. The proxy refuses a request matching such a rule either
+  way.
+
   The credential replaces the placeholder in the target byte for byte: no
   percent-encoding is added and none is removed, because the proxy cannot
   know which URI component the placeholder sits in nor what the origin

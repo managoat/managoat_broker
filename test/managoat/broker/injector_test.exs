@@ -123,21 +123,62 @@ defmodule Managoat.Broker.InjectorTest do
     assert {"X-Other", "untouched"} in out
   end
 
-  test "an incomplete substitute rule leaves headers unchanged" do
-    headers = [{"Authorization", "Bearer placeholder"}]
+  test "a substitute rule with a valid placeholder and no credential forwards it as written" do
+    # The same choice `:custom` makes for an unfilled `{{ KEY }}`: the
+    # origin refuses a placeholder, which is a clearer failure than a
+    # credential sent empty, and the proxy has nothing better to do.
+    headers = [{"Authorization", "Bearer __api_token__"}]
 
-    for rule <- [
-          %Rule{name: "empty", pattern: "api.example.com", scheme: :substitute, placeholder: ""},
+    session = %Session{
+      rules: [
+        %Rule{
+          name: "missing",
+          pattern: "api.example.com",
+          scheme: :substitute,
+          placeholder: "__api_token__"
+        }
+      ]
+    }
+
+    assert {:ok, ^headers, "missing"} = inject(headers, "api.example.com", "/", session)
+  end
+
+  test "a substitute rule whose placeholder is not usable as one is refused" do
+    # This used to pass through silently, which is the failure mode the
+    # check exists for: a rule that cannot do its job doing nothing.
+    for placeholder <- ["", "id", "token", "account_sid"] do
+      session = %Session{
+        rules: [
           %Rule{
-            name: "missing",
+            name: "bad",
             pattern: "api.example.com",
             scheme: :substitute,
-            placeholder: "placeholder"
+            placeholder: placeholder,
+            credential: "real"
           }
-        ] do
-      session = %Session{rules: [rule]}
-      assert {:ok, ^headers, rule_name} = inject(headers, "api.example.com", "/", session)
-      assert rule_name == rule.name
+        ]
+      }
+
+      assert {:error, {:unusable_placeholder, "bad"}} =
+               inject([{"Authorization", "x"}], "api.example.com", "/", session),
+             "#{inspect(placeholder)} was accepted"
+    end
+  end
+
+  describe "valid_placeholder?/1" do
+    test "a placeholder needs length, a letter or digit, and a boundary" do
+      for good <- ~w(__github_token__ sk-__openai_api_key__ {{TOKEN}} __a__ tok-en x.y.z __1__) do
+        assert Injector.valid_placeholder?(good), "#{good} was rejected"
+      end
+
+      for bad <- ["", "id", "abc", "token", "account_sid", "APIKEY", "____", "___"] do
+        refute Injector.valid_placeholder?(bad), "#{inspect(bad)} was accepted"
+      end
+    end
+
+    test "anything that is not a binary is not a placeholder" do
+      refute Injector.valid_placeholder?(nil)
+      refute Injector.valid_placeholder?(:token)
     end
   end
 

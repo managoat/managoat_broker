@@ -461,6 +461,35 @@ defmodule Managoat.Broker.ProxyTest do
       refute_logged(meta, "__bot_token__")
     end
 
+    test "a rule whose placeholder is not usable as one is refused, and says why", ctx do
+      Memory.put(ctx.store, ctx.token, %{
+        ctx.session
+        | rules: [
+            %Rule{
+              name: "loose",
+              pattern: "localhost",
+              scheme: :substitute,
+              placeholder: "id",
+              credential: "real-secret"
+            }
+          ]
+      })
+
+      tls = tunnel(ctx, ctx.token)
+
+      log =
+        capture_log(fn ->
+          :ok = :ssl.send(tls, "GET /videos/id/1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+          {:ok, reply} = :ssl.recv(tls, 0, 5_000)
+          assert reply =~ "HTTP/1.1 403"
+        end)
+
+      # Without the check this request would have gone to
+      # /videos/real-secret/1 and put the credential in a path nobody chose.
+      assert log =~ ~s(rule "loose")
+      refute log =~ "real-secret"
+    end
+
     test "a credential that would split the request line is refused, not forwarded", ctx do
       Memory.put(ctx.store, ctx.token, %{
         ctx.session

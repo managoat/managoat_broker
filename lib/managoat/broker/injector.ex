@@ -62,6 +62,7 @@ defmodule Managoat.Broker.Injector do
           {:ok, [header()], String.t(), String.t() | nil}
           | {:error, :denied}
           | {:error, {:unsafe_credential, String.t() | nil, :target | :header}}
+          | {:error, {:unusable_placeholder, String.t() | nil}}
   def inject(headers, host, port, target, %Session{} = session) do
     headers = Enum.reject(headers, fn {k, _} -> String.downcase(k) in @hop_by_hop end)
 
@@ -74,7 +75,7 @@ defmodule Managoat.Broker.Injector do
       [first | _] = matched ->
         substitutions = Enum.filter(matched, &(&1.scheme == :substitute))
 
-        case unsafe(substitutions, headers, target) do
+        case unusable(substitutions) || unsafe(substitutions, headers, target) do
           nil ->
             headers = Enum.reduce(substitutions, headers, &substitute_headers/2)
             target = Enum.reduce(substitutions, target, &substitute_target/2)
@@ -87,11 +88,47 @@ defmodule Managoat.Broker.Injector do
 
             {:ok, headers, target, first.name}
 
+          {rule, :placeholder} ->
+            {:error, {:unusable_placeholder, rule.name}}
+
           {rule, surface} ->
             {:error, {:unsafe_credential, rule.name, surface}}
         end
     end
   end
+
+  @doc """
+  Is this usable as a `:substitute` placeholder?
+
+  Substitution is a literal find-and-replace over header values and the
+  request target, so a placeholder that occurs in ordinary text rewrites
+  ordinary text. `"id"` would rewrite every `id` in every matching path,
+  and `"account_sid"` is a real field name that appears in URLs — the
+  credential would land somewhere nobody chose, and nothing would raise.
+
+  A usable placeholder therefore:
+
+    * is at least four characters,
+    * contains at least one letter or digit, and
+    * carries a boundary — it begins or ends with `__`, or contains a
+      character outside `[A-Za-z0-9_]`.
+
+  `__github_token__`, `sk-__openai_api_key__` and `{{TOKEN}}` pass;
+  `id`, `token` and `account_sid` do not.
+
+  Hosts should call this when they build a session, so a bad rule fails
+  where it is written rather than on every request it would have matched.
+  `inject/5` enforces it either way.
+  """
+  @spec valid_placeholder?(term()) :: boolean()
+  def valid_placeholder?(placeholder) when is_binary(placeholder) do
+    byte_size(placeholder) >= 4 and
+      String.match?(placeholder, ~r/[A-Za-z0-9]/) and
+      (String.starts_with?(placeholder, "__") or String.ends_with?(placeholder, "__") or
+         String.match?(placeholder, ~r/[^A-Za-z0-9_]/))
+  end
+
+  def valid_placeholder?(_placeholder), do: false
 
   @doc "Does the host part of a rule `pattern` match this host and port, whatever the path?"
   @spec host_matches?(String.t(), String.t(), :inet.port_number()) :: boolean()
@@ -222,6 +259,19 @@ defmodule Managoat.Broker.Injector do
   end
 
   defp substitute_target(_rule, target), do: target
+
+  # The first matched rule whose placeholder is not usable as one. Checked
+  # whether or not it currently occurs anywhere: a placeholder like `id` is
+  # dangerous exactly when it turns up in a path nobody was thinking about,
+  # so waiting until it does would report the problem on the request that
+  # already leaked the credential. Refusing every request the rule matches
+  # is loud, and a rule that rewrites arbitrary text should be loud.
+  defp unusable(rules) do
+    case Enum.find(rules, fn %Rule{placeholder: p} -> not valid_placeholder?(p) end) do
+      nil -> nil
+      rule -> {rule, :placeholder}
+    end
+  end
 
   # The first rule whose credential cannot be written where its placeholder
   # sits, and which surface that was. Nil when every substitution is safe.

@@ -783,6 +783,14 @@ defmodule Managoat.Broker.Proxy do
   # and it carries the status the proxy sent.
   defp refuse_request(session, head, host, reason) do
     case reason do
+      {:unusable_placeholder, rule} ->
+        Logger.warning(
+          "broker: rule #{inspect(rule)} has a placeholder that is not usable as one: " <>
+            "it must be four characters or more, hold a letter or digit, and carry a " <>
+            "boundary (`__` at either end, or a character outside [A-Za-z0-9_]). " <>
+            "Without one it rewrites ordinary text in paths and header values."
+        )
+
       {:unsafe_credential, rule, surface} ->
         Logger.warning(
           "broker: rule #{inspect(rule)} cannot be substituted into a request #{surface}: " <>
