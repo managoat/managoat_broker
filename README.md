@@ -121,6 +121,19 @@ segment, where `:` is legal unencoded and `%3A` is a different URL. A
 credential holding a control character or a space would split the request
 line, so it is refused with `403` rather than written into a target.
 
+A rule the host could not put a credential in — `credential` left `nil`, or
+holding something other than the shape its scheme needs — has no header to
+build. Every request it matches is refused with **`502`**, carrying
+`error: :credential_missing` on the request event, rather than being sent
+without the header: the broker failed to obtain a credential, which is not
+the agent doing anything wrong, and `502` is what tells it to retry once
+the credential is provisioned. `403` would say it is not allowed, which is
+a different and misleading thing. Inside a tunnel the request is refused
+without ending the tunnel, unless the refused request left a body behind it
+in the stream. `:substitute` and an unfilled `{{ KEY }}` are the exceptions
+described above: a placeholder the origin can see is the clearer failure
+there.
+
 A placeholder must be distinctive enough to be one: four characters or
 more, holding a letter or digit, and carrying a boundary — `__` at either
 end, or a character outside `[A-Za-z0-9_]`. Substitution is a literal

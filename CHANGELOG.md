@@ -10,6 +10,37 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-03
+
+### Fixed
+
+- **A matched rule with no usable credential is refused with `502`, not a
+  crash.** `Injector.put_auth/2` was guarded on the credential's shape and
+  had no fallback, so a `:bearer`, `:basic`, `:api_key` or `:custom` rule
+  holding `nil` — or anything else the scheme cannot build a header from —
+  raised `FunctionClauseError` inside the handler. The client got no
+  response at all, no `[:managoat, :broker, :request]` event was emitted so
+  the failure was invisible in the host's audit log, and inside a tunnel it
+  killed the tunnel rather than the request.
+
+  It now refuses, with the status and the reasoning Agent Vault's
+  `ErrCredentialMissing` documents: the broker failed to obtain a
+  credential, so an agent should retry once it is provisioned. `403` would
+  say it is not allowed, which is a different and misleading thing. The
+  event carries `status: 502` and `error: :credential_missing`, and the
+  warning names the rule and the scheme and never the credential. Inside a
+  tunnel the request is refused without ending the tunnel, unless the
+  refused request left a body behind it in the stream — the proxy will not
+  read a body it is refusing to forward, so the next head could not be
+  found. It is the shape a `Store` hands back when provisioning is
+  incomplete, when decryption failed, or when an OAuth grant was never
+  connected (`ErrOAuthNotConnected`, `ErrOAuthRefreshFailed`).
+
+  Unchanged, deliberately: a `:substitute` rule with a valid placeholder
+  and no credential still forwards the placeholder as written, and a
+  `:custom` template still leaves an unfilled `{{ KEY }}` alone. There the
+  origin refusing a visible placeholder is the clearer failure. Closes #18.
+
 ## [0.6.1] - 2026-09-03
 
 ### Added

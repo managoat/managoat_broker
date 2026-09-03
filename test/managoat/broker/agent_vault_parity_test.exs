@@ -6,6 +6,8 @@ defmodule Managoat.Broker.AgentVaultParityTest do
   # not a guess. What is deliberately NOT ported is listed at the bottom.
   use Managoat.Broker.ProxyCase, async: true
 
+  import ExUnit.CaptureLog
+
   setup do
     ctx = start_rig()
 
@@ -265,6 +267,28 @@ defmodule Managoat.Broker.AgentVaultParityTest do
     tls = tunnel(ctx, ctx.token)
     :ok = :ssl.send(tls, "POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nhi")
     assert read_json(tls)["body"] == "hi"
+  end
+
+  # ErrCredentialMissing (internal/brokercore/errors.go): "a credential
+  # referenced by the matched service's auth config is not set or could not
+  # be decrypted. Callers surface 502 so agents retry only after the
+  # credential is provisioned." Its OAuth relatives, ErrOAuthNotConnected
+  # and ErrOAuthRefreshFailed, reach a `Store` here as the same shape — a
+  # matched rule holding no credential — and get the same answer.
+  test "a matched rule whose credential the host could not supply is 502", ctx do
+    Memory.put(ctx.store, ctx.token, %{
+      ctx.session
+      | rules: [%Rule{name: "unprovisioned", pattern: "localhost", scheme: :bearer}]
+    })
+
+    tls = tunnel(ctx, ctx.token)
+
+    capture_log(fn ->
+      :ok = :ssl.send(tls, "GET /needs-a-token HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+      {:ok, reply} = :ssl.recv(tls, 0, 5_000)
+      assert reply =~ "HTTP/1.1 502"
+    end)
   end
 
   # Not ported, and each one a decision rather than a backlog item. Agent
