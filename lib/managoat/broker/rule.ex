@@ -16,6 +16,14 @@ defmodule Managoat.Broker.Rule do
   matching the rest. A port pins the request's port; without one any port
   matches. Matching is case-insensitive on the host and ignores the query.
 
+  When several patterns match one request, the **most specific** sets the
+  header: an exact host beats a wildcard (whatever their paths), then a
+  pinned port beats any port, then the longest literal path prefix wins,
+  and declaration order breaks the rest. So defaults can be written first
+  with overrides appended, which is the natural way to build the list, and
+  a list of equally-specific rules behaves exactly as declaration order
+  alone would.
+
   ## Schemes
 
   | `scheme` | fields | effect on a matched request |
@@ -53,8 +61,11 @@ defmodule Managoat.Broker.Rule do
   encoded. One holding a control character or a space is refused rather
   than written into the target, since it would split the request line.
 
-  Several rules may match one request. The first matched rule that sets a
-  header is the one that does; every matched `:substitute` rule applies.
+  Several rules may match one request. The most specific one that sets a
+  header is the one that does, by the precedence above; every matched
+  `:substitute` rule applies, in declaration order. A `:passthrough` rule
+  never displaces a rule that injects, however specific it is: it is how a
+  host is allowed under `deny`, not a way to suppress injection.
 
   A rule the host could not put a credential in — `credential` left `nil`,
   or holding something other than the shape its scheme needs — has no

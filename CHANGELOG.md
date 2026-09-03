@@ -10,6 +10,53 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-03
+
+Rule matching is by specificity rather than declaration order. A host whose
+rules are all equally specific sees no change; one that wrote defaults with
+overrides appended was silently getting the default, and now gets the
+override.
+
+### Changed
+
+- **The most specific matched rule sets the header, not the first
+  declared.** Four ordered tiers, matching Agent Vault's `MatchService`
+  (internal/broker/broker.go): an exact host beats a `*.` wildcard even
+  when the wildcard carries the longer path; within a host tier a pinned
+  port beats any port; within a host and port tier the longest literal
+  path prefix wins; and declaration order breaks what is left — so a list
+  of equally-specific rules resolves exactly as it did before.
+
+  Defaults first with overrides appended is the natural way to build a
+  rule list, and under declaration order the appended override lost. The
+  failure was not an error but a wrong answer: the request went out with
+  the *generic* credential and **succeeded**, and the event named the rule
+  that had won, so the audit log looked fine too. The README documented
+  the old rule, so this was a divergence from Agent Vault rather than a
+  bug — but one that produced a wrong answer rather than no answer, and it
+  was never recorded in the deviations list. Closes #19.
+
+- **The request event's `rule` names the rule that actually set the
+  header**, falling back to the first matched rule when none did. It named
+  the first matched rule before, which after this change could name a rule
+  that did nothing. Where a `:substitute` rule and a header rule both
+  match, the event now names the header rule; the substitutions still
+  apply.
+
+### Decided, and unchanged
+
+- **`:passthrough` never displaces a rule that injects**, however specific
+  it is. It is how a host is allowed under `deny`, not a way to suppress
+  injection: if an exact-host allowlist entry outranked a wildcard
+  `:bearer`, a host would *stop* attaching the credential by allowlisting
+  more precisely. A host that means "reach this untouched" says so by not
+  writing a rule that injects. Pinned by a test under both policies.
+
+- **Every matched `:substitute` rule still applies, in declaration
+  order.** Scoring picks one rule to set the header and says nothing about
+  the substitutions, because several placeholders can legitimately appear
+  in one request.
+
 ## [0.6.2] - 2026-09-03
 
 ### Fixed

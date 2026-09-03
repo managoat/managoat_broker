@@ -111,9 +111,16 @@ is the port separator), a `scheme` and the fields the scheme needs:
 | `:substitute` | `placeholder`, `credential` | every header value **and the request target** have the placeholder replaced by the credential |
 | `:passthrough` | none | forwarded untouched; under `deny`, how a host is allowed |
 
-The first matched rule that sets a header does; every matched
-`:substitute` rule applies, in rule order, to the header values and to the
-request target. A credential goes into the target byte for byte — nothing
+When several rules match, the **most specific** one that sets a header
+does: an exact host beats a `*.` wildcard (whatever their paths), then a
+pinned port beats any port, then the longest literal path prefix wins, and
+declaration order breaks what is left — so defaults written first with
+overrides appended work the way they read, and a list of equally-specific
+rules resolves exactly as declaration order alone would. These are Agent
+Vault's tiers. A `:passthrough` rule never displaces a rule that injects,
+however specific it is: it is how a host is allowed under `deny`, not a way
+to suppress injection. Every matched `:substitute` rule applies, in
+declaration order, to the header values and to the request target. A credential goes into the target byte for byte — nothing
 is percent-encoded on the way in, because the proxy cannot know which URI
 component a placeholder sits in nor what the origin expects, and the
 canonical case says so: a bot token is `<digits>:<rest>` in a path

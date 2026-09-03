@@ -278,7 +278,7 @@ defmodule Managoat.Broker.InjectorTest do
     end
   end
 
-  test "a substitute rule and a header rule on one host both apply; the first names the outcome" do
+  test "a substitute rule and a header rule on one host both apply; the header rule names it" do
     session = %Session{
       rules: [
         %Rule{
@@ -298,8 +298,12 @@ defmodule Managoat.Broker.InjectorTest do
       ]
     }
 
+    # The event names the rule that set the header, which is the one an
+    # operator reading the log needs to find: the substitutions applied too,
+    # and there may be several of them, but only one rule decided the
+    # credential.
     headers = [{"Authorization", "Bearer __oauth__"}, {"x-api-key", "__key__"}]
-    {:ok, out, "sub"} = inject(headers, "api.anthropic.com", "/v1/messages", session)
+    {:ok, out, "key"} = inject(headers, "api.anthropic.com", "/v1/messages", session)
     assert {"Authorization", "Bearer oauth-real"} in out
     assert {"x-api-key", "sk-real"} in out
   end
@@ -327,6 +331,172 @@ defmodule Managoat.Broker.InjectorTest do
   test "the match is on the exact host: api.github.com is not github.com" do
     {:ok, _, "github-git"} = inject(@headers, "github.com")
     {:ok, _, nil} = inject(@headers, "gist.github.com")
+  end
+
+  describe "precedence among matched rules" do
+    # Defaults first, overrides appended is the natural way to build a rule
+    # list, and under declaration order the appended override lost: the
+    # request went out with the *wrong* credential and succeeded, and the
+    # event named the rule that had won, so even the audit log looked fine.
+    # Agent Vault scored its services instead (`MatchService`,
+    # internal/broker/broker.go); these are its tiers.
+    defp scored(rules, host, port \\ 443, path \\ "/") do
+      session = %Session{rules: rules, unmatched_host_policy: :passthrough}
+
+      case Injector.inject([{"Accept", "*/*"}], host, port, path, session) do
+        {:ok, headers, _target, rule} -> {rule, headers}
+        other -> other
+      end
+    end
+
+    test "an exact host beats a wildcard, whichever was declared first" do
+      wildcard = %Rule{
+        name: "org-wide",
+        pattern: "*.github.com",
+        scheme: :bearer,
+        credential: "GENERIC"
+      }
+
+      exact = %Rule{
+        name: "api-specific",
+        pattern: "api.github.com",
+        scheme: :bearer,
+        credential: "SPECIFIC"
+      }
+
+      for rules <- [[wildcard, exact], [exact, wildcard]] do
+        assert {"api-specific", headers} = scored(rules, "api.github.com")
+        assert {"authorization", "Bearer SPECIFIC"} in headers
+      end
+    end
+
+    test "an exact host beats a wildcard even when the wildcard's path is longer" do
+      # The tiers are ordered rather than added up: a rule naming this host
+      # is a statement about this host, and a wildcard is a default.
+      rules = [
+        %Rule{
+          name: "wide-deep",
+          pattern: "*.github.com/repos/octocat",
+          scheme: :bearer,
+          credential: "GENERIC"
+        },
+        %Rule{name: "exact", pattern: "api.github.com", scheme: :bearer, credential: "SPECIFIC"}
+      ]
+
+      assert {"exact", _} = scored(rules, "api.github.com", 443, "/repos/octocat/hello")
+    end
+
+    test "a pinned port beats any port, within a host tier" do
+      rules = [
+        %Rule{name: "any-port", pattern: "db.example.com", scheme: :bearer, credential: "ANY"},
+        %Rule{name: "pinned", pattern: "db.example.com:8443", scheme: :bearer, credential: "PIN"}
+      ]
+
+      assert {"pinned", _} = scored(rules, "db.example.com", 8443)
+      assert {"any-port", _} = scored(rules, "db.example.com", 443)
+    end
+
+    test "the longest literal path prefix wins, within a host and port tier" do
+      rules = [
+        %Rule{name: "root", pattern: "h.example", scheme: :bearer, credential: "ROOT"},
+        %Rule{name: "api", pattern: "h.example/api/*", scheme: :bearer, credential: "API"},
+        %Rule{name: "v2", pattern: "h.example/api/v2/*", scheme: :bearer, credential: "V2"}
+      ]
+
+      assert {"v2", _} = scored(rules, "h.example", 443, "/api/v2/users")
+      assert {"api", _} = scored(rules, "h.example", 443, "/api/v1/users")
+      assert {"root", _} = scored(rules, "h.example", 443, "/other")
+    end
+
+    test "equally specific rules still resolve in declaration order" do
+      # The compatibility guarantee: a host whose rules are all the same
+      # specificity sees exactly what it saw before.
+      rules = [
+        %Rule{name: "first", pattern: "h.example", scheme: :bearer, credential: "FIRST"},
+        %Rule{name: "second", pattern: "h.example", scheme: :bearer, credential: "SECOND"}
+      ]
+
+      assert {"first", headers} = scored(rules, "h.example")
+      assert {"authorization", "Bearer FIRST"} in headers
+    end
+
+    test "a passthrough rule never displaces a header rule, however specific it is" do
+      # `:passthrough` is how a host is allowed under `deny`, not a way to
+      # suppress injection. If an exact-host allowlist entry outranked a
+      # wildcard `:bearer`, a host would *stop* attaching the credential by
+      # allowlisting more precisely — a silent change in the direction
+      # nobody wants. A host that means "reach this untouched" says so by
+      # not writing a rule that injects.
+      rules = [
+        %Rule{name: "org", pattern: "*.github.com", scheme: :bearer, credential: "GENERIC"},
+        %Rule{name: "allow", pattern: "api.github.com", scheme: :passthrough}
+      ]
+
+      for policy <- [:passthrough, :deny] do
+        session = %Session{rules: rules, unmatched_host_policy: policy}
+
+        assert {:ok, headers, _, "org"} =
+                 Injector.inject([{"Accept", "*/*"}], "api.github.com", 443, "/", session)
+
+        assert {"authorization", "Bearer GENERIC"} in headers
+      end
+    end
+
+    test "every matched substitute rule still applies, in declaration order" do
+      # Scoring picks one rule to set the header; it says nothing about the
+      # substitutions, because several placeholders can legitimately appear
+      # in one request. Declaration order still governs them, which matters
+      # when one placeholder is a prefix of another.
+      rules = [
+        %Rule{
+          name: "wide",
+          pattern: "*.example.com",
+          scheme: :substitute,
+          placeholder: "__token_a__",
+          credential: "AAA"
+        },
+        %Rule{
+          name: "exact",
+          pattern: "api.example.com",
+          scheme: :substitute,
+          placeholder: "__token_b__",
+          credential: "BBB"
+        },
+        %Rule{
+          name: "key",
+          pattern: "api.example.com",
+          scheme: :api_key,
+          header: "x-api-key",
+          credential: "KEY"
+        }
+      ]
+
+      session = %Session{rules: rules, unmatched_host_policy: :passthrough}
+      headers = [{"X-A", "__token_a__"}, {"X-B", "__token_b__"}]
+
+      assert {:ok, out, "/x/AAA/BBB", "key"} =
+               Injector.inject(
+                 headers,
+                 "api.example.com",
+                 443,
+                 "/x/__token_a__/__token_b__",
+                 session
+               )
+
+      assert {"X-A", "AAA"} in out
+      assert {"X-B", "BBB"} in out
+      assert {"x-api-key", "KEY"} in out
+    end
+
+    test "the winning rule is the one whose credential is refused when it has none" do
+      rules = [
+        %Rule{name: "org", pattern: "*.github.com", scheme: :bearer, credential: "GENERIC"},
+        %Rule{name: "api", pattern: "api.github.com", scheme: :bearer}
+      ]
+
+      assert {:error, {:credential_missing, "api", :bearer}} =
+               scored(rules, "api.github.com")
+    end
   end
 
   describe "matches?/4" do

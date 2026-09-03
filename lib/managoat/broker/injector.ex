@@ -11,10 +11,39 @@ defmodule Managoat.Broker.Injector do
   `unmatched_host_policy` decides: `:passthrough` sends the request
   untouched, `:deny` refuses it.
 
-  Several rules may match. The first matched rule that sets a header is the
-  one that does (a host's rules are in the order the host declared them);
-  every matched `:substitute` rule applies, in that order, to the header
-  values *and* to the request target.
+  Several rules may match. The **most specific** one that sets a header is
+  the one that does; every matched `:substitute` rule applies, in the order
+  the host declared them, to the header values *and* to the request target.
+
+  ## Which rule sets the header
+
+  Specificity is four ordered tiers, and the first one that separates two
+  rules decides:
+
+    1. an exact host beats a `*.` wildcard — even when the wildcard rule
+       carries the longer path, because a rule naming this host is a
+       statement about this host and a wildcard is a default;
+    2. within a host tier, a pattern that pins a port beats one that
+       matches any port;
+    3. within a host and port tier, the longest literal path prefix wins
+       (a trailing `*` is not part of it);
+    4. declaration order breaks what is left — so a list of
+       equally-specific rules resolves exactly as it always did.
+
+  Defaults first with overrides appended is the natural way to build a rule
+  list, and under declaration order the appended override lost: the request
+  went out with the *wrong* credential and succeeded, and the event named
+  the rule that had won, so even the audit log looked fine. These are Agent
+  Vault's tiers (`MatchService`, internal/broker/broker.go).
+
+  `:passthrough` never takes part. It is how a host is allowed under
+  `deny`, not a way to suppress injection, so an exact-host allowlist entry
+  beside a wildcard rule that injects does not stop the credential being
+  attached — a host that means "reach this untouched" says so by not
+  writing a rule that injects. `:substitute` does not take part either:
+  scoring picks one rule, and several placeholders can legitimately appear
+  in one request, so every matched substitute rule applies in declaration
+  order.
 
   ## Substitution and the request target
 
@@ -68,8 +97,9 @@ defmodule Managoat.Broker.Injector do
   @doc """
   Rewrite `headers` and the request `target` for a request to
   `host`:`port`. Returns `{:ok, headers, target, rule_name}` with the
-  target to forward and the name of the first matched rule (`nil` for
-  passthrough), `{:error, :denied}`, `{:error, {:unsafe_credential,
+  target to forward and the name of the rule that applied — the one that
+  set the header, or the first matched rule when none did, and `nil` for
+  passthrough — `{:error, :denied}`, `{:error, {:unsafe_credential,
   rule_name, surface}}` when a credential could not be written into the
   target, or `{:error, {:credential_missing, rule_name, scheme}}` when a
   matched rule that sets a header holds no usable credential.
@@ -102,13 +132,13 @@ defmodule Managoat.Broker.Injector do
             headers = Enum.reduce(substitutions, headers, &substitute_headers/2)
             target = Enum.reduce(substitutions, target, &substitute_target/2)
 
-            case Enum.find(matched, &(&1.scheme not in [:substitute, :passthrough])) do
+            case header_rule(matched) do
               nil ->
                 {:ok, headers, target, first.name}
 
               rule ->
                 case put_auth(headers, rule) do
-                  {:ok, headers} -> {:ok, headers, target, first.name}
+                  {:ok, headers} -> {:ok, headers, target, rule.name}
                   :error -> {:error, {:credential_missing, rule.name, rule.scheme}}
                 end
             end
@@ -158,8 +188,8 @@ defmodule Managoat.Broker.Injector do
   @doc "Does the host part of a rule `pattern` match this host and port, whatever the path?"
   @spec host_matches?(String.t(), String.t(), :inet.port_number()) :: boolean()
   def host_matches?(pattern, host, port) when is_binary(pattern) do
-    host_only = pattern |> String.split("/", parts: 2) |> hd()
-    matches?(host_only, host, port, "/")
+    {host_part, _path_part} = split_pattern(pattern)
+    matches?(host_part, host, port, "/")
   end
 
   @doc """
@@ -173,16 +203,74 @@ defmodule Managoat.Broker.Injector do
   """
   @spec matches?(String.t(), String.t(), :inet.port_number(), String.t()) :: boolean()
   def matches?(pattern, host, port, path) when is_binary(pattern) do
-    {host_part, path_part} =
-      case String.split(pattern, "/", parts: 2) do
-        [h] -> {h, nil}
-        [h, p] -> {h, "/" <> p}
-      end
-
+    {host_part, path_part} = split_pattern(pattern)
     {host_pattern, port_pattern} = split_host_pattern(host_part)
 
     host_pattern_matches?(canonical(host_pattern), canonical(host)) and
       port_matches?(port_pattern, port) and path_matches?(path_part, path)
+  end
+
+  # Which matched rule sets the header: the most specific one, not the one
+  # the host happened to declare first. Rules are built defaults-first with
+  # overrides appended, which is the natural way to write them, and under
+  # declaration order that appended override lost — silently, and with the
+  # wrong credential on a request that then *succeeded*. Agent Vault scored
+  # its services the same way (`MatchService`, internal/broker/broker.go)
+  # and these are its tiers.
+  #
+  # `:passthrough` is not a candidate, exactly as before. It is how a host
+  # is allowed under `deny`, not a way to suppress injection, so an
+  # exact-host allowlist entry beside a wildcard `:bearer` must not stop the
+  # credential being attached — a host that means "reach this untouched"
+  # says it by not writing a rule that injects. `:substitute` is not a
+  # candidate either: every matched substitute rule applies, in declaration
+  # order, because several placeholders can legitimately appear in one
+  # request, and scoring picks one rule.
+  defp header_rule(matched) do
+    candidates =
+      matched
+      |> Enum.with_index()
+      |> Enum.filter(fn {rule, _index} -> rule.scheme not in [:substitute, :passthrough] end)
+
+    case candidates do
+      [] -> nil
+      _ -> candidates |> Enum.min_by(&specificity/1) |> elem(0)
+    end
+  end
+
+  # The sort key, most specific first. Every component is written so that
+  # ascending term order *is* descending specificity: `false` sorts before
+  # `true`, so an exact host beats a wildcard and a pinned port beats any
+  # port; the path length is negated, so the longest literal prefix wins;
+  # and the declaration index breaks what is left, so a list of
+  # equally-specific rules resolves exactly as it always did.
+  #
+  # The tiers are ordered, not added together: an exact host wins even when
+  # the wildcard rule carries the longer path, because a rule naming this
+  # host is a statement about this host and a wildcard is a default.
+  defp specificity({%Rule{pattern: pattern}, index}) do
+    {host_part, path_part} = split_pattern(pattern)
+    {host_pattern, port_pattern} = split_host_pattern(host_part)
+
+    {wildcard_host?(host_pattern), any_port?(port_pattern), -path_length(path_part), index}
+  end
+
+  defp wildcard_host?("*." <> _suffix), do: true
+  defp wildcard_host?(_host_pattern), do: false
+
+  defp any_port?(port_pattern), do: is_nil(port_pattern)
+
+  # How much literal path a pattern pins. The trailing `*` is not part of
+  # it: `/api/*` and `/api` both commit to `/api`, and what separates them
+  # is which requests they match, not how specific they are.
+  defp path_length(nil), do: 0
+  defp path_length(path), do: path |> String.trim_trailing("*") |> byte_size()
+
+  defp split_pattern(pattern) do
+    case String.split(pattern, "/", parts: 2) do
+      [host_part] -> {host_part, nil}
+      [host_part, path] -> {host_part, "/" <> path}
+    end
   end
 
   # An address has many spellings and one meaning: `::1`, `::0001` and

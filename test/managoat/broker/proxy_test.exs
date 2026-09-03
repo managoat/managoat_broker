@@ -339,6 +339,32 @@ defmodule Managoat.Broker.ProxyTest do
     assert_receive {:request, _, %{path: "/no", outcome: :denied, rule: nil}}
   end
 
+  test "the most specific rule injects, and the event names it", ctx do
+    # Declaration order is the tiebreak, not the rule: the wider rule is
+    # first here, which is how a host writes defaults with overrides
+    # appended. Before this, the default won and the event said so, so a
+    # request went out with the wrong credential and looked fine in the log.
+    session = attach_request_telemetry(ctx)
+
+    Memory.put(ctx.store, ctx.token, %{
+      session
+      | rules: [
+          %Rule{name: "wide", pattern: "localhost", scheme: :bearer, credential: "generic"},
+          %Rule{name: "narrow", pattern: "localhost/repos/*", scheme: :bearer, credential: "spec"}
+        ]
+    })
+
+    tls = tunnel(ctx, ctx.token)
+
+    {_, echoed} = request(tls, "GET /repos/x HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert echoed["headers"]["authorization"] == "Bearer spec"
+    assert_receive {:request, _, %{path: "/repos/x", rule: "narrow", outcome: :injected}}
+
+    {_, echoed} = request(tls, "GET /other HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert echoed["headers"]["authorization"] == "Bearer generic"
+    assert_receive {:request, _, %{path: "/other", rule: "wide", outcome: :injected}}
+  end
+
   test "the request log carries the path and never the query, on both request paths", ctx do
     # A query can hold a credential the proxy never brokered — a signed URL
     # is one in itself — so the event's `path` is the URL path alone, while
