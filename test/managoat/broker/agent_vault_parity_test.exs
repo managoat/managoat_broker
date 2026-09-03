@@ -181,11 +181,46 @@ defmodule Managoat.Broker.AgentVaultParityTest do
     assert text == "Bearer real-secret|hi"
   end
 
+  # TestMITMSubstitutionPath / TestMITMSubstitutionQuery, and the `telegram`
+  # preset those tests exercise: a bot API carries its token in the URL, so
+  # a substitution that reached headers only could not broker it at all.
+  test "a placeholder in the path and in the query is substituted in the forwarded target",
+       ctx do
+    Memory.put(ctx.store, ctx.token, %{
+      ctx.session
+      | rules: [
+          %Rule{
+            name: "telegram",
+            pattern: "localhost",
+            scheme: :substitute,
+            placeholder: "__bot_token__",
+            credential: "123456:AAE-real"
+          }
+        ]
+    })
+
+    tls = tunnel(ctx, ctx.token)
+
+    :ok =
+      :ssl.send(
+        tls,
+        "GET /bot__bot_token__/sendMessage?key=__bot_token__ HTTP/1.1\r\n" <>
+          "Host: localhost\r\n\r\n"
+      )
+
+    echoed = read_json(tls)
+
+    # Agent Vault substituted wherever the placeholder appeared, without
+    # being told which URI component it was in.
+    assert echoed["path"] == "/bot123456:AAE-real/sendMessage"
+    assert echoed["query"] == "key=123456:AAE-real"
+  end
+
   # Not ported, on purpose:
-  # - TestMITMSubstitution* (placeholder rewriting in path, query, body and
-  #   arbitrary headers): the `:substitute` rule reaches header values only,
-  #   which covers an inference key a runtime sends as a bearer or an
-  #   `x-api-key`; a credential a client puts in the URL is not brokered.
+  # - TestMITMSubstitutionBody (placeholder rewriting inside a request
+  #   body): the `:substitute` rule reaches header values and the request
+  #   target, so a credential in a header, a path or a query is brokered,
+  #   but a body is still forwarded as bytes.
   # - TestCopyWSFrames* (credential substitution inside WebSocket frames).
   # - TestMITM*RateLimit* (auth-failure rate limiting on the proxy port).
   # - TestResponseLimit* / TestRequestBodyCap* (body size caps; Agent Vault's

@@ -10,6 +10,59 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-03
+
+This minor bump carries one breaking change to a public function; see
+Changed. Everything else is additive.
+
+### Added
+
+- `:substitute` rules now reach the **request target** as well as header
+  values, so a credential a client puts in the URL is brokered: a
+  placeholder in a path (`/bot<token>/sendMessage`, the bot-API shape Agent
+  Vault shipped a `telegram` preset for) or in a query (`?key=<token>`) is
+  replaced with the real credential, on both the CONNECT and the
+  absolute-form request path. A tenant declares its placeholder and nothing
+  more; it does not have to tell the proxy where the client put it. Row 1
+  of #5.
+
+  The credential replaces the placeholder byte for byte: nothing is
+  percent-encoded on the way in and nothing is decoded. The proxy cannot
+  know which URI component a placeholder sits in nor what encoding the
+  origin expects, and the canonical case settles it — a bot token is
+  `<digits>:<rest>` in a path segment, where `:` is legal unencoded and
+  `%3A` would be a different URL. A credential needing percent-encoding is
+  declared already encoded.
+
+  A credential that cannot be written where its placeholder sits is refused
+  with `403` rather than written out or silently encoded. The two surfaces
+  do not have the same rule: a **target** refuses a control character or a
+  space, either of which would end the request line and start a second
+  request; a **header value** refuses CR or LF, which would end the field
+  and start another one, but not a space, which is ordinary there and fills
+  a signature header. Each rule is checked only against the surfaces its
+  placeholder actually reaches. The refusal is `{:error,
+  {:unsafe_credential, rule_name, surface}}`, and logs the rule's name and
+  the surface at `:warning` — never the credential.
+
+  The header half closes a gap that predates this change: `:substitute`
+  already reached header values, with no CRLF guard at all.
+
+  Rules still match against the target the client sent, and telemetry is
+  still derived from that original, so a placeholder in a path is logged as
+  the placeholder and one in a query is not logged at all.
+
+### Changed
+
+- **Breaking:** `Managoat.Broker.Injector.inject/5` returns `{:ok, headers,
+  target, rule_name}` rather than `{:ok, headers, rule_name}`, and may
+  return `{:error, {:unsafe_credential, rule_name, surface}}` beside
+  `{:error, :denied}`. Injection now rewrites the request target, so the target to
+  forward is part of its result. Callers other than
+  `Managoat.Broker.Proxy` are not expected — the function is public because
+  the proxy is thin over it — but a consumer calling it directly has to
+  take the extra element.
+
 ## [0.1.3] - 2026-09-03
 
 ### Fixed

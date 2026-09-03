@@ -381,6 +381,129 @@ defmodule Managoat.Broker.ProxyTest do
     refute_logged(absolute_meta, secret)
   end
 
+  # ---------------------------------------------------------------------------
+  # A credential a client puts in the URL
+
+  describe "substitution into the request target" do
+    setup ctx do
+      session = %{
+        ctx.session
+        | rules: [
+            %Rule{
+              name: "bot",
+              pattern: "localhost",
+              scheme: :substitute,
+              placeholder: "__bot_token__",
+              credential: "123456:AAE-real"
+            }
+          ]
+      }
+
+      Memory.put(ctx.store, ctx.token, session)
+      :ok
+    end
+
+    test "a placeholder in the path reaches the origin as the credential, through a tunnel",
+         ctx do
+      tls = tunnel(ctx, ctx.token)
+
+      {head, echoed} =
+        request(tls, "GET /bot__bot_token__/sendMessage HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+      assert head =~ "HTTP/1.1 200"
+      assert echoed["path"] == "/bot123456:AAE-real/sendMessage"
+    end
+
+    test "a placeholder in the query reaches the origin as the credential, through a tunnel",
+         ctx do
+      tls = tunnel(ctx, ctx.token)
+
+      {_, echoed} =
+        request(tls, "GET /v1/models?key=__bot_token__ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+      assert echoed["path"] == "/v1/models"
+      assert echoed["query"] == "key=123456:AAE-real"
+    end
+
+    test "a placeholder in the path and in the query, over absolute-form plain HTTP", ctx do
+      {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+      :ok =
+        :gen_tcp.send(
+          tcp,
+          "GET http://localhost:#{ctx.http_port}/bot__bot_token__/send?key=__bot_token__ " <>
+            "HTTP/1.1\r\nHost: localhost\r\n" <>
+            "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
+        )
+
+      [_, body] = String.split(read_until_closed(tcp), "\r\n\r\n", parts: 2)
+      echoed = Jason.decode!(body)
+
+      assert echoed["path"] == "/bot123456:AAE-real/send"
+      assert echoed["query"] == "key=123456:AAE-real"
+    end
+
+    test "the event carries the placeholder for a path, nothing for a query, never the credential",
+         ctx do
+      handler = "sub-test-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler,
+        [:managoat, :broker, :request],
+        fn _e, m, meta, pid -> send(pid, {:request, m, meta}) end,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      tls = tunnel(ctx, ctx.token)
+
+      # A path substitution: the event names the target the *client* sent,
+      # so the placeholder is what gets logged, not the credential.
+      request(tls, "GET /bot__bot_token__/sendMessage HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+      assert_receive {:request, _, %{path: "/bot__bot_token__/sendMessage"} = meta}
+      refute_logged(meta, "123456:AAE-real")
+
+      # A query substitution: row 0 already drops the query, so there is
+      # nothing to log and nothing to leak.
+      request(tls, "GET /v1/models?key=__bot_token__ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+      assert_receive {:request, _, %{path: "/v1/models"} = meta}
+      refute_logged(meta, "123456:AAE-real")
+      refute_logged(meta, "__bot_token__")
+    end
+
+    test "a credential that would split the request line is refused, not forwarded", ctx do
+      Memory.put(ctx.store, ctx.token, %{
+        ctx.session
+        | rules: [
+            %Rule{
+              name: "bad",
+              pattern: "localhost",
+              scheme: :substitute,
+              placeholder: "__bot_token__",
+              credential: "tok\r\nGET /evil HTTP/1.1"
+            }
+          ]
+      })
+
+      tls = tunnel(ctx, ctx.token)
+
+      log =
+        capture_log(fn ->
+          :ok = :ssl.send(tls, "GET /bot__bot_token__/x HTTP/1.1\r\nHost: localhost\r\n\r\n")
+          {:ok, reply} = :ssl.recv(tls, 0, 5_000)
+          assert reply =~ "HTTP/1.1 403"
+        end)
+
+      # The operator has to fix this, so the line names the rule — and only
+      # the rule.
+      assert log =~ ~s(rule "bad")
+      refute log =~ "GET /evil"
+    end
+  end
+
   # The event's own fields, whatever their shape, must not contain `secret`
   # anywhere: asserting on `path` alone would miss it leaking into another
   # field later.
