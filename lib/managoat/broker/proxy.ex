@@ -237,8 +237,8 @@ defmodule Managoat.Broker.Proxy do
   # CONNECT: a TLS tunnel the proxy terminates on both ends
 
   defp tunnel(socket, host, port, session, state) do
-    with {:ok, address} <- resolve(socket, host, port, state),
-         {:ok, upstream} <- connect_tls(socket, address, host, port, state) do
+    with {:ok, addresses} <- resolve(socket, host, port, state),
+         {:ok, upstream} <- connect_tls(socket, addresses, host, port, state) do
       Socket.send(socket, "HTTP/1.1 200 Connection established\r\n\r\n")
       connect_event(session, host, port, :ok)
 
@@ -280,38 +280,106 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
-  # The origin's address, vetted. A sandbox may name any host, and the proxy
-  # sits on the operator's network, so a name that resolves into a private,
-  # loopback or link-local range is refused before any connection exists:
-  # otherwise the broker is a door from a third-party sandbox into the
-  # operator's network. The connection is then made to the vetted address,
-  # not the name, so a rebinding DNS answer between check and dial changes
-  # nothing. Off only for a test rig (`allow_private_upstreams: true`),
-  # whose origins are on localhost.
+  # The origin's addresses, vetted. A sandbox may name any host, and the
+  # proxy sits on the operator's network, so a name that resolves into a
+  # private, loopback or link-local range is refused before any connection
+  # exists: otherwise the broker is a door from a third-party sandbox into
+  # the operator's network. The connection is then made to a vetted
+  # address, not the name, so a rebinding DNS answer between check and dial
+  # changes nothing. Off only for a test rig
+  # (`allow_private_upstreams: true`), whose origins are on localhost.
+  #
+  # **Every** answer is vetted, and one blocked answer refuses the host.
+  # Checking only the address about to be dialed would make the refusal
+  # depend on resolver ordering, so a host with one public and one private
+  # answer would be refused or allowed by luck. This is the rule Agent
+  # Vault used.
+  #
+  # Both families are asked for, and the vetted list is returned in the
+  # order they will be dialed: IPv4 first, then IPv6. That order is
+  # deliberate — every host that worked before still takes the address it
+  # took before, and IPv6 is a path for hosts that previously had none.
   defp resolve(socket, host, port, state) do
-    case :inet.getaddrs(String.to_charlist(host), :inet) do
-      {:ok, [address | _]} ->
-        if private?(address) and not state.allow_private_upstreams do
-          Logger.info("broker: refused #{host}:#{port}: resolves to #{:inet.ntoa(address)}")
-          reply(socket, 403, "Forbidden")
-          {:error, :private_upstream}
-        else
-          {:ok, address}
-        end
-
-      {:error, reason} ->
-        Logger.info("broker: upstream #{host}:#{port} did not resolve: #{inspect(reason)}")
+    case addresses(host) do
+      [] ->
+        Logger.info("broker: upstream #{host}:#{port} did not resolve")
         reply(socket, 502, "Bad Gateway")
-        {:error, reason}
+        {:error, :nxdomain}
+
+      addresses ->
+        case blocked(addresses) do
+          [first | _] when not state.allow_private_upstreams ->
+            Logger.info("broker: refused #{host}:#{port}: resolves to #{:inet.ntoa(first)}")
+            reply(socket, 403, "Forbidden")
+            {:error, :private_upstream}
+
+          _ ->
+            {:ok, addresses}
+        end
     end
   end
 
   @doc """
-  Is this an address the proxy must not dial on a sandbox's behalf? RFC
-  1918, loopback, link-local (including the cloud metadata address), CGNAT,
-  and the unspecified address.
+  Which of `addresses` the proxy must not dial on a sandbox's behalf.
+
+  Empty means the host may be reached. A non-empty result is a refusal of
+  the *host*, whichever address was about to be dialed: checking only the
+  one chosen would make the answer depend on resolver ordering, so a name
+  with one public and one private answer would be refused or allowed by
+  luck. Refusing on any blocked answer is the conservative rule, and the
+  one Agent Vault used.
   """
-  @spec private?(:inet.ip4_address()) :: boolean()
+  @spec blocked([:inet.ip_address()]) :: [:inet.ip_address()]
+  def blocked(addresses), do: Enum.filter(addresses, &private?/1)
+
+  # A and AAAA. A family that does not answer is not an error — most hosts
+  # have only one — so only the empty union is a failure to resolve.
+  defp addresses(host) do
+    name = String.to_charlist(host)
+
+    Enum.uniq(family_addresses(name, :inet) ++ family_addresses(name, :inet6))
+  end
+
+  defp family_addresses(name, family) do
+    case :inet.getaddrs(name, family) do
+      {:ok, addresses} -> addresses
+      {:error, _} -> []
+    end
+  end
+
+  # Each vetted address in turn, so a host whose first address will not
+  # take a connection still reaches one that will. The reason reported is
+  # the last one's, since that is the attempt that finally failed.
+  defp connect_any([address], dial), do: dial.(address)
+
+  defp connect_any([address | rest], dial) do
+    case dial.(address) do
+      {:ok, _} = ok -> ok
+      {:error, _} -> connect_any(rest, dial)
+    end
+  end
+
+  @doc """
+  Is this an address the proxy must not dial on a sandbox's behalf?
+
+  IPv4: RFC 1918, loopback, link-local (including the cloud metadata
+  address), CGNAT, and the unspecified address.
+
+  IPv6 is the same policy, and it has to be, or adding AAAA resolution
+  would hand a sandbox every private range back through a second address
+  family. Refused are the unspecified address, loopback, link-local
+  (`fe80::/10`), the deprecated site-local prefix (`fec0::/10`),
+  unique-local (`fc00::/7`), multicast (`ff00::/8`), the documentation
+  prefix (`2001:db8::/32`) and the discard prefix (`100::/64`).
+
+  The forms that *embed* an IPv4 address are decoded and run through the
+  IPv4 policy rather than judged on their own, because otherwise each is a
+  spelling of a blocked address that this function would call public:
+  IPv4-mapped (`::ffff:169.254.169.254`), IPv4-compatible (`::169.254.
+  169.254`), 6to4 (`2002:a9fe:a9fe::`) and the NAT64 well-known prefix
+  (`64:ff9b::169.254.169.254`) all reach the cloud metadata service.
+  """
+  @spec private?(:inet.ip_address()) :: boolean()
   def private?({10, _, _, _}), do: true
   def private?({127, _, _, _}), do: true
   def private?({169, 254, _, _}), do: true
@@ -319,10 +387,35 @@ defmodule Managoat.Broker.Proxy do
   def private?({192, 168, _, _}), do: true
   def private?({100, b, _, _}) when b in 64..127, do: true
   def private?({0, _, _, _}), do: true
+
+  # An IPv6 address carrying an IPv4 one. These come first: they are
+  # spellings of an IPv4 address, and the IPv4 policy is what decides them.
+  # `::` and `::1` fall out of the IPv4-compatible clause, since `0.0.0.0`
+  # and `0.0.0.1` are both refused by the rules above.
+  def private?({0, 0, 0, 0, 0, 0xFFFF, hi, lo}), do: private?(embedded_v4(hi, lo))
+  def private?({0, 0, 0, 0, 0, 0, hi, lo}), do: private?(embedded_v4(hi, lo))
+  def private?({0x2002, hi, lo, _, _, _, _, _}), do: private?(embedded_v4(hi, lo))
+  def private?({0x64, 0xFF9B, 0, 0, 0, 0, hi, lo}), do: private?(embedded_v4(hi, lo))
+
+  # Ranges, as the first 16-bit group: fe80::/10, fc00::/7, ff00::/8.
+  def private?({a, _, _, _, _, _, _, _}) when a in 0xFE80..0xFEBF, do: true
+  def private?({a, _, _, _, _, _, _, _}) when a in 0xFEC0..0xFEFF, do: true
+  def private?({a, _, _, _, _, _, _, _}) when a in 0xFC00..0xFDFF, do: true
+  def private?({a, _, _, _, _, _, _, _}) when a in 0xFF00..0xFFFF, do: true
+  def private?({0x2001, 0xDB8, _, _, _, _, _, _}), do: true
+  def private?({0x100, 0, 0, 0, _, _, _, _}), do: true
+
   def private?(_), do: false
 
-  defp connect_tls(socket, address, host, port, state) do
-    case :ssl.connect(address, port, upstream_ssl_options(host, state), @connect_timeout) do
+  # Two 16-bit groups back into the four octets they spell.
+  defp embedded_v4(hi, lo), do: {div(hi, 256), rem(hi, 256), div(lo, 256), rem(lo, 256)}
+
+  defp connect_tls(socket, addresses, host, port, state) do
+    dial = fn address ->
+      :ssl.connect(address, port, upstream_ssl_options(host, address, state), @connect_timeout)
+    end
+
+    case connect_any(addresses, dial) do
       {:ok, _} = ok ->
         ok
 
@@ -498,8 +591,8 @@ defmodule Managoat.Broker.Proxy do
   defp forward_plain(socket, head, rest, host, port, target, session, state) do
     with {:ok, headers, target, rule} <-
            inject_or_deny(socket, head, host, port, target, session),
-         {:ok, address} <- resolve(socket, host, port, state),
-         {:ok, upstream} <- connect_plain(socket, address, host, port) do
+         {:ok, addresses} <- resolve(socket, host, port, state),
+         {:ok, upstream} <- connect_plain(socket, addresses, host, port) do
       connect_event(session, host, port, :ok)
 
       headers = [
@@ -544,8 +637,12 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
-  defp connect_plain(socket, address, host, port) do
-    case :gen_tcp.connect(address, port, [:binary, active: false], @connect_timeout) do
+  defp connect_plain(socket, addresses, host, port) do
+    dial = fn address ->
+      :gen_tcp.connect(address, port, [:binary, family(address), active: false], @connect_timeout)
+    end
+
+    case connect_any(addresses, dial) do
       {:ok, _} = ok ->
         ok
 
@@ -555,6 +652,11 @@ defmodule Managoat.Broker.Proxy do
         {:error, reason}
     end
   end
+
+  # The socket has to be opened in the address's own family; an `:inet`
+  # socket cannot dial an 8-tuple.
+  defp family(address) when tuple_size(address) == 8, do: :inet6
+  defp family(_address), do: :inet
 
   defp copy_body_plain(client, upstream, framing, buffer) do
     case HTTP.take_body(framing, buffer) do
@@ -601,18 +703,38 @@ defmodule Managoat.Broker.Proxy do
   # ---------------------------------------------------------------------------
 
   # A pure keyword list, so `Keyword.merge` with the host's options works.
-  defp upstream_ssl_options(host, state) do
+  defp upstream_ssl_options(host, address, state) do
     [
       mode: :binary,
       active: false,
       verify: :verify_peer,
       cacerts: :public_key.cacerts_get(),
-      server_name_indication: String.to_charlist(host),
       customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)],
       alpn_advertised_protocols: ["http/1.1"],
       depth: 5
     ]
+    |> Keyword.merge(sni(host))
     |> Keyword.merge(state.upstream_ssl_options)
+    |> Kernel.++([family(address)])
+  end
+
+  # RFC 6066 has no name to put in SNI for an origin named by address and
+  # forbids sending one, so the option is **omitted** for a literal —
+  # never set to `:disable`, which turns hostname verification off
+  # altogether: `:ssl` would then accept a certificate naming any address
+  # at all. Omitted, `:ssl` falls back to the `Host` argument of
+  # `connect/4`, which is the vetted address tuple, and verifies the
+  # certificate's `iPAddress` SAN against it.
+  #
+  # For a name the option stays load-bearing, because the proxy dials the
+  # vetted address rather than the name: without it `:ssl` would verify
+  # the tuple against a certificate full of DNS names and refuse every
+  # origin.
+  defp sni(host) do
+    case :inet.parse_address(String.to_charlist(host)) do
+      {:ok, _address} -> []
+      {:error, _} -> [server_name_indication: String.to_charlist(host)]
+    end
   end
 
   defp client_ssl_options(certs, host) do

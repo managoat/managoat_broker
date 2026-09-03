@@ -102,20 +102,69 @@ defmodule Managoat.Broker.ProxyCase do
   @doc "A fresh 32-byte CA seed."
   def seed, do: :crypto.strong_rand_bytes(32)
 
-  @doc "A CA and a leaf for `localhost` signed by it, as Bandit's `transport_options`."
+  @doc """
+  A CA and a leaf signed by it, as Bandit's `transport_options`.
+
+  The leaf covers `localhost` and both loopback addresses, so the same
+  origin can be reached by name or by literal — which is what an IPv6 test
+  needs, since a client verifying `[::1]` looks for an `iPAddress` SAN and
+  nothing else.
+  """
   def origin_tls do
     ca_key = X509.PrivateKey.new_ec(:secp256r1)
     ca = X509.Certificate.self_signed(ca_key, "/CN=Origin CA", template: :root_ca)
     key = X509.PrivateKey.new_ec(:secp256r1)
 
+    sans =
+      X509.Certificate.Extension.subject_alt_name(
+        dNSName: "localhost",
+        iPAddress: <<127, 0, 0, 1>>,
+        iPAddress: <<0::120, 1>>
+      )
+
     cert =
       key
       |> X509.PublicKey.derive()
-      |> X509.Certificate.new("/CN=localhost", ca, ca_key,
-        extensions: [subject_alt_name: X509.Certificate.Extension.subject_alt_name(["localhost"])]
-      )
+      |> X509.Certificate.new("/CN=localhost", ca, ca_key, extensions: [subject_alt_name: sans])
 
     {ca, [cert: X509.Certificate.to_der(cert), key: {:ECPrivateKey, X509.PrivateKey.to_der(key)}]}
+  end
+
+  @doc """
+  A CA and a leaf naming one IP address and nothing else, as Bandit's
+  `transport_options`. For testing that upstream verification actually
+  checks the address it connected to.
+  """
+  def origin_tls_for_address(octets) do
+    ca_key = X509.PrivateKey.new_ec(:secp256r1)
+    ca = X509.Certificate.self_signed(ca_key, "/CN=Address CA", template: :root_ca)
+    key = X509.PrivateKey.new_ec(:secp256r1)
+
+    sans = X509.Certificate.Extension.subject_alt_name(iPAddress: :binary.bin_to_list(octets))
+
+    cert =
+      key
+      |> X509.PublicKey.derive()
+      |> X509.Certificate.new("/CN=address", ca, ca_key, extensions: [subject_alt_name: sans])
+
+    {ca, [cert: X509.Certificate.to_der(cert), key: {:ECPrivateKey, X509.PrivateKey.to_der(key)}]}
+  end
+
+  @doc "Start an HTTPS origin on [::1]:0 with `tls`; returns its port."
+  def start_https_origin_v6(tls) do
+    pid =
+      ExUnit.Callbacks.start_supervised!(
+        {Bandit,
+         plug: Origin,
+         scheme: :https,
+         port: 0,
+         ip: {0, 0, 0, 0, 0, 0, 0, 1},
+         thousand_island_options: [transport_options: tls]},
+        id: make_ref()
+      )
+
+    {:ok, {_, port}} = ThousandIsland.listener_info(pid)
+    port
   end
 
   @doc "Start an HTTPS origin on 127.0.0.1:0 with `tls`; returns its port."
@@ -128,6 +177,37 @@ defmodule Managoat.Broker.ProxyCase do
          port: 0,
          ip: {127, 0, 0, 1},
          thousand_island_options: [transport_options: tls]},
+        id: make_ref()
+      )
+
+    {:ok, {_, port}} = ThousandIsland.listener_info(pid)
+    port
+  end
+
+  @doc """
+  Does this host have an IPv6 loopback that can carry a listener?
+
+  A CI runner without IPv6 is a real configuration, not a broken one, so
+  the tests that need `::1` skip on it rather than fail — but only when it
+  is genuinely absent, which is why this binds rather than reading a
+  config.
+  """
+  def ipv6_loopback? do
+    case :gen_tcp.listen(0, [:binary, :inet6, ip: {0, 0, 0, 0, 0, 0, 0, 1}]) do
+      {:ok, socket} ->
+        :gen_tcp.close(socket)
+        true
+
+      {:error, _} ->
+        false
+    end
+  end
+
+  @doc "Start a plain HTTP origin on [::1]:0; returns its port."
+  def start_http_origin_v6 do
+    pid =
+      ExUnit.Callbacks.start_supervised!(
+        {Bandit, plug: Origin, scheme: :http, port: 0, ip: {0, 0, 0, 0, 0, 0, 0, 1}},
         id: make_ref()
       )
 
@@ -177,7 +257,9 @@ defmodule Managoat.Broker.ProxyCase do
          store: {Memory, store},
          ca_seed: seed,
          allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, true),
-         upstream_ssl_options: [cacerts: [X509.Certificate.to_der(origin_ca)]]
+         upstream_ssl_options: [
+           cacerts: [X509.Certificate.to_der(origin_ca) | Keyword.get(opts, :extra_cacerts, [])]
+         ]
        ]}
     )
 
@@ -185,6 +267,7 @@ defmodule Managoat.Broker.ProxyCase do
       name: name,
       store: store,
       seed: seed,
+      origin_tls: tls,
       ca_der: CA.der(seed),
       proxy_port: Managoat.Broker.port(name),
       https_port: https_port,

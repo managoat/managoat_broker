@@ -182,19 +182,20 @@ defmodule Managoat.Broker.HTTP do
   The host and port a request-target names, and the origin-form target to
   forward. Absolute-form (`http://host/path`) is what a client sends a
   forward proxy for plain HTTP; an authority (`host:port`) is a `CONNECT`.
+
+  An IPv6 literal is bracketed in both forms — `CONNECT [::1]:8443` and
+  `GET http://[::1]:8080/x` — since without brackets there is no telling
+  which colon separates the port. The host is returned unbracketed, which
+  is what a rule matches and what a certificate has to cover.
   """
   @spec destination(head()) ::
           {:ok, {String.t(), :inet.port_number()}, String.t()} | {:error, :bad_target}
   def destination(%{method: "CONNECT", target: target}) do
-    case String.split(target, ":") do
-      [host, port] ->
-        case Integer.parse(port) do
-          {p, ""} when p in 1..65_535 -> {:ok, {host, p}, target}
-          _ -> {:error, :bad_target}
-        end
-
-      _ ->
-        {:error, :bad_target}
+    with {:ok, host, port} <- split_authority(target),
+         {p, ""} when p in 1..65_535 <- Integer.parse(port) do
+      {:ok, {host, p}, target}
+    else
+      _ -> {:error, :bad_target}
     end
   end
 
@@ -211,6 +212,25 @@ defmodule Managoat.Broker.HTTP do
   end
 
   def destination(_), do: {:error, :bad_target}
+
+  # `host:port`, or `[v6]:port` — an IPv6 literal is bracketed precisely
+  # because it is full of colons, so the brackets are what say which colon
+  # is the port separator. The host comes back without them: it is what
+  # rules match, what SNI would name and what a certificate has to cover,
+  # and none of those want the brackets. The target is forwarded as sent.
+  defp split_authority("[" <> rest) do
+    case String.split(rest, "]:", parts: 2) do
+      [host, port] -> {:ok, host, port}
+      _ -> :error
+    end
+  end
+
+  defp split_authority(target) do
+    case String.split(target, ":") do
+      [host, port] -> {:ok, host, port}
+      _ -> :error
+    end
+  end
 
   @doc """
   Split `buffer` per `framing`: `{:done, consumed, rest}` once the whole

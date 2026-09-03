@@ -10,6 +10,86 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-03
+
+IPv6 upstreams. Row 3 of #5. This is a minor bump because the SSRF guard's
+policy widens and `Managoat.Broker.Injector` gains a pattern form; nothing
+that worked before behaves differently.
+
+### Added
+
+- **IPv6 upstreams.** Names resolve over A *and* AAAA rather than A alone,
+  so an IPv6-only origin connects instead of getting a hard `502`. Both
+  request paths may also name an IPv6 literal, bracketed —
+  `CONNECT [::1]:8443` and `GET http://[::1]:8080/x` — since without
+  brackets there is no telling which colon separates the port. An
+  unbracketed literal is a `400`, not a guess about where the request goes.
+
+- Rule patterns take a bracketed IPv6 literal, with or without a port:
+  `[::1]`, `[::1]:8443`, `[::1]/api`. A bare literal is not a pattern; its
+  first colon reads as the port separator, so it matches nothing rather
+  than matching somewhere else by accident.
+
+  A pattern that is an address is matched by **value**, not by spelling, on
+  both sides: `[::1]`, `[::0001]` and `[0:0:0:0:0:0:0:1]` are one pattern,
+  and a client naming any of them matches any of them. Matching the text
+  would have failed silently — no rule matched, so no credential attached
+  and no error — which is the worst way for a rule to be wrong. A name is
+  still matched case-insensitively.
+
+- A leaf certificate for a literal host carries an `iPAddress` SAN in the
+  four or sixteen octets RFC 5280 asks for, rather than a `dNSName` of the
+  address's text. A client verifying an address looks for exactly that, so
+  the previous behaviour would have failed verification with a message
+  about the name — a confusing way to learn the proxy issued the wrong kind
+  of certificate.
+
+- `Managoat.Broker.Proxy.blocked/1`, the vetting decision as a named
+  function: which of a set of resolved addresses the proxy must not dial.
+
+### Changed
+
+- **The SSRF guard covers IPv6**, and had to before AAAA resolution could
+  be added at all: `private?/1` matched four-element tuples only, so
+  resolving AAAA without extending it would have handed a sandbox every
+  private range back through a second address family, `::ffff:169.254.
+  169.254` included.
+
+  Refused are the unspecified address, loopback, `fe80::/10`, the
+  deprecated `fec0::/10`, `fc00::/7`, `ff00::/8`, `2001:db8::/32` and
+  `100::/64`. The four forms that *embed* an IPv4 address — IPv4-mapped
+  (`::ffff:`), IPv4-compatible (`::`), 6to4 (`2002:`) and the NAT64
+  well-known prefix (`64:ff9b::`) — are decoded and judged by the IPv4
+  policy, because each is otherwise a spelling of a blocked address that a
+  range check alone would call public. All four reach the cloud metadata
+  service.
+
+- **Every resolved address is vetted before any dial, and one blocked
+  answer refuses the host.** Checking only the address about to be dialed
+  would make the refusal depend on resolver ordering, so a name with one
+  public and one private answer would be refused or allowed by luck. This
+  is the conservative rule Agent Vault used.
+
+- The dial then walks the vetted addresses in order rather than taking the
+  first, so a host whose first address will not take a connection still
+  reaches one that will. The order is IPv4 then IPv6: every host that
+  worked before takes the address it took before, and IPv6 is a path for
+  hosts that previously had none.
+
+- An origin named by address gets no SNI: RFC 6066 has no name to put
+  there and forbids sending one, so the option is **omitted** rather than
+  set to `:disable`. `:disable` would have been the obvious spelling and is
+  a hostname-verification bypass — `:ssl` then checks nothing, and accepts
+  a certificate naming any address at all. Omitted, `:ssl` falls back to
+  the connect call's own `Host` argument, which is the vetted address, and
+  matches the certificate's `iPAddress` SAN against it.
+
+### Notes
+
+The `:ipv6` tests bind a listener on `::1`, and `test_helper.exs` excludes
+that tag on a host with no IPv6 loopback — a real configuration rather than
+a broken checkout. Everywhere else they run.
+
 ## [0.3.0] - 2026-09-03
 
 This minor bump changes the shape and the timing of the request event; see
