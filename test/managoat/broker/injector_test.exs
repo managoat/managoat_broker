@@ -379,6 +379,26 @@ defmodule Managoat.Broker.InjectorTest do
       assert {:ok, _, "/x/a:b/c?d&e=f+g%20h@i", "r"} = target("/x/__p__", session, "h.test")
     end
 
+    test "a credential holding CR or LF is refused in a header too" do
+      # A header value ends at CRLF, so a credential carrying one would
+      # start a second header field the tenant never wrote.
+      session = %{
+        @bot
+        | rules: [
+            %Rule{
+              name: "r",
+              pattern: "h.test",
+              scheme: :substitute,
+              placeholder: "__p__",
+              credential: "tok\r\nX-Injected: yes"
+            }
+          ]
+      }
+
+      assert {:error, {:unsafe_credential, "r", :header}} =
+               Injector.inject([{"Authorization", "__p__"}], "h.test", 443, "/x", session)
+    end
+
     test "a credential that would split the request line is refused" do
       for bad <- ["a\r\nGET /evil HTTP/1.1", "a b", "a\tb", "a\u007fb"] do
         session = %{
@@ -394,7 +414,8 @@ defmodule Managoat.Broker.InjectorTest do
             ]
         }
 
-        assert {:error, {:unsafe_credential, "r"}} = target("/x/__p__", session, "h.test")
+        assert {:error, {:unsafe_credential, "r", :target}} =
+                 target("/x/__p__", session, "h.test")
       end
     end
 

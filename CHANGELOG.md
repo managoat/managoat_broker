@@ -34,13 +34,19 @@ Changed. Everything else is additive.
   `%3A` would be a different URL. A credential needing percent-encoding is
   declared already encoded.
 
-  A credential that could not appear in a request target at all — one
-  holding a control character or a space, which would end the request line
-  and start a second request — is refused with `403` rather than written
-  into the target or silently encoded. The refusal logs the rule's name, at
-  `:warning`, and never the credential. Rules whose substitution does not
-  reach the target are not checked, since a header value may legitimately
-  hold a space.
+  A credential that cannot be written where its placeholder sits is refused
+  with `403` rather than written out or silently encoded. The two surfaces
+  do not have the same rule: a **target** refuses a control character or a
+  space, either of which would end the request line and start a second
+  request; a **header value** refuses CR or LF, which would end the field
+  and start another one, but not a space, which is ordinary there and fills
+  a signature header. Each rule is checked only against the surfaces its
+  placeholder actually reaches. The refusal is `{:error,
+  {:unsafe_credential, rule_name, surface}}`, and logs the rule's name and
+  the surface at `:warning` — never the credential.
+
+  The header half closes a gap that predates this change: `:substitute`
+  already reached header values, with no CRLF guard at all.
 
   Rules still match against the target the client sent, and telemetry is
   still derived from that original, so a placeholder in a path is logged as
@@ -50,8 +56,8 @@ Changed. Everything else is additive.
 
 - **Breaking:** `Managoat.Broker.Injector.inject/5` returns `{:ok, headers,
   target, rule_name}` rather than `{:ok, headers, rule_name}`, and may
-  return `{:error, {:unsafe_credential, rule_name}}` beside `{:error,
-  :denied}`. Injection now rewrites the request target, so the target to
+  return `{:error, {:unsafe_credential, rule_name, surface}}` beside
+  `{:error, :denied}`. Injection now rewrites the request target, so the target to
   forward is part of its result. Callers other than
   `Managoat.Broker.Proxy` are not expected — the function is public because
   the proxy is thin over it — but a consumer calling it directly has to

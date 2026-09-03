@@ -548,10 +548,10 @@ defmodule Managoat.Broker.Proxy do
   # one says so in a log line. The rule's name, never its credential.
   defp log_refused_request(session, head, host, reason) do
     case reason do
-      {:unsafe_credential, rule} ->
+      {:unsafe_credential, rule, surface} ->
         Logger.warning(
-          "broker: rule #{inspect(rule)} cannot be substituted into a request target: " <>
-            "its credential holds a control character or a space"
+          "broker: rule #{inspect(rule)} cannot be substituted into a request #{surface}: " <>
+            "its credential holds a character that would break the request"
         )
 
       _ ->

@@ -32,9 +32,11 @@ defmodule Managoat.Broker.Injector do
 
   The credential replaces the placeholder byte for byte: nothing is
   percent-encoded on the way in and nothing is decoded. A credential that
-  could not appear in a request target at all — one holding a control
-  character or a space, which would split the request line — is refused
-  instead, as `{:error, {:unsafe_credential, rule_name}}`.
+  cannot be written where its placeholder sits is refused instead, as
+  `{:error, {:unsafe_credential, rule_name, surface}}`: a control
+  character or a space would split the request line in a `:target`, and CR
+  or LF would end the field and start another in a `:header`. A space in a
+  header value is ordinary and is not refused.
   """
 
   alias Managoat.Broker.{Rule, Session}
@@ -59,7 +61,7 @@ defmodule Managoat.Broker.Injector do
   @spec inject([header()], String.t(), :inet.port_number(), String.t(), Session.t()) ::
           {:ok, [header()], String.t(), String.t() | nil}
           | {:error, :denied}
-          | {:error, {:unsafe_credential, String.t() | nil}}
+          | {:error, {:unsafe_credential, String.t() | nil, :target | :header}}
   def inject(headers, host, port, target, %Session{} = session) do
     headers = Enum.reject(headers, fn {k, _} -> String.downcase(k) in @hop_by_hop end)
 
@@ -72,7 +74,7 @@ defmodule Managoat.Broker.Injector do
       [first | _] = matched ->
         substitutions = Enum.filter(matched, &(&1.scheme == :substitute))
 
-        case unsafe_in_target(substitutions, target) do
+        case unsafe(substitutions, headers, target) do
           nil ->
             headers = Enum.reduce(substitutions, headers, &substitute_headers/2)
             target = Enum.reduce(substitutions, target, &substitute_target/2)
@@ -85,8 +87,8 @@ defmodule Managoat.Broker.Injector do
 
             {:ok, headers, target, first.name}
 
-          rule ->
-            {:error, {:unsafe_credential, rule.name}}
+          {rule, surface} ->
+            {:error, {:unsafe_credential, rule.name, surface}}
         end
     end
   end
@@ -183,31 +185,50 @@ defmodule Managoat.Broker.Injector do
 
   defp substitute_target(_rule, target), do: target
 
-  # Verbatim substitution is safe for the reserved characters — `/`, `?`,
-  # `#`, `&`, `=` and the rest change which resource the origin sees, and
-  # choosing the placeholder's position is the tenant's business — but not
-  # for the characters a request target cannot hold at all. A credential
-  # carrying CR or LF would end the request line and start a second
-  # request; a space would end the target and make the rest the HTTP
-  # version. Those are refused rather than encoded, because encoding them
-  # would silently send the origin a credential it cannot use.
+  # The first rule whose credential cannot be written where its placeholder
+  # sits, and which surface that was. Nil when every substitution is safe.
   #
-  # Only rules that actually reach the target are checked: a header value
-  # may legitimately contain a space, and a substitution that never touches
-  # the target must not be refused for it.
-  defp unsafe_in_target(rules, target) do
-    Enum.find(rules, fn
-      %Rule{placeholder: p, credential: v} when is_binary(p) and p != "" and is_binary(v) ->
-        String.contains?(target, p) and not target_safe?(v)
+  # Both surfaces are checked, and they do not have the same rule. In a
+  # request target, verbatim substitution is safe for the reserved
+  # characters — `/`, `?`, `#`, `&`, `=` and the rest change which resource
+  # the origin sees, and choosing the placeholder's position is the
+  # tenant's business — but not for the characters a target cannot hold at
+  # all: CR or LF would end the request line and start a second request,
+  # and a space would end the target and make the rest the HTTP version. In
+  # a header value CR and LF are the whole danger, because they end the
+  # field and start another one; a space is ordinary there, and a signature
+  # header is full of them.
+  #
+  # Neither is encoded around. Encoding a credential would send the origin
+  # something it cannot use, quietly, which is worse than a refusal that
+  # names the rule.
+  #
+  # Only rules that actually reach a surface are checked against it, so a
+  # header credential holding a space is not refused for a target rule it
+  # never touches.
+  defp unsafe(rules, headers, target) do
+    Enum.find_value(rules, fn
+      %Rule{placeholder: p, credential: v} = rule
+      when is_binary(p) and p != "" and is_binary(v) ->
+        cond do
+          String.contains?(target, p) and not target_safe?(v) ->
+            {rule, :target}
+
+          Enum.any?(headers, fn {_k, hv} -> String.contains?(hv, p) end) and crlf?(v) ->
+            {rule, :header}
+
+          true ->
+            nil
+        end
 
       _ ->
-        false
+        nil
     end)
   end
 
-  defp target_safe?(value) do
-    not String.match?(value, ~r/[\x00-\x20\x7f]/)
-  end
+  defp target_safe?(value), do: not String.match?(value, ~r/[\x00-\x20\x7f]/)
+
+  defp crlf?(value), do: String.contains?(value, "\r") or String.contains?(value, "\n")
 
   defp replace(headers, name, value) do
     down = String.downcase(name)
