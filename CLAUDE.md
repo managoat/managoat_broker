@@ -34,7 +34,7 @@ error, not a silent default that happens to suit Fountain.
 ```bash
 mise install        # Erlang/OTP 28.3 + Elixir 1.19.2, from .tool-versions
 mix deps.get
-mix test            # 7 test files
+mix test            # 11 test files
 mix precommit       # the whole CI gate, locally
 ```
 
@@ -45,8 +45,8 @@ on them.
 ## Repo layout
 
 ```
-lib/                    10 modules — README.md is the guide to them
-test/                   7 test files, mirroring lib/
+lib/                    11 modules — README.md is the guide to them
+test/                   11 test files, mirroring lib/
 scripts/release.exs     the facts about a release, shared by the PR gate
                         and the publish workflow (no dependencies: it runs
                         before `mix deps.get` in both)

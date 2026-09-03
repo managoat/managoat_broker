@@ -61,6 +61,26 @@ defmodule Managoat.Broker.Proxy do
   `:unauthenticated` there is no session and no destination yet, so `host`
   and `port` are nil and `meta` is empty.
 
+  ## Timeouts
+
+  Three bound a connection, and one bounds a request. `@head_timeout` (30s)
+  is how long the proxy waits for a client to begin a request;
+  `@idle_timeout` (300s) is the gap it allows between reads, on the way in
+  and on the way back; `@connect_timeout` (10s) is the upstream dial. All
+  three are per operation, so none of them bounds a client that keeps
+  sending — one byte at a time, forever.
+
+  `request_read_timeout` does: it is a wall-clock deadline on reading one
+  request, head and body, starting with that request's first byte. A read
+  that would outlast it is cut short, the request is refused with `408`
+  where there is still a client to tell, and the connection closes. It
+  defaults to five minutes and a host can name its own, because it is the
+  only bound here that can refuse a *valid* request: a large upload over a
+  slow link is legitimate and slow. The response side is deliberately
+  outside it — a `git clone` or an SSE stream runs long on the way back,
+  which is the traffic this proxy exists for — as are WebSocket frames
+  after an upgrade, which are no longer a request being read.
+
   This module is a `ThousandIsland.Handler`; ThousandIsland calls its
   `child_spec/1` for every accepted connection, which is why the listener's
   own child spec lives on `Managoat.Broker` and not here.
@@ -76,6 +96,20 @@ defmodule Managoat.Broker.Proxy do
   @head_timeout 30_000
   @idle_timeout 300_000
   @connect_timeout 10_000
+
+  # The default wall-clock bound on reading *one* request, head and body,
+  # overridable per listener with `request_read_timeout`. The two timeouts
+  # above are per `recv`, so they bound the gap between reads and not the
+  # read: a client sending one byte every four minutes never tripped either,
+  # and at that rate the default 1 GiB body cap is reached in roughly eight
+  # thousand years. The cap bounds volume; this bounds time.
+  #
+  # It is the one timeout here that can refuse a *valid* request — a large
+  # upload over a slow link is a legitimate request that takes a long time —
+  # which is why it is the one a host can name. The response side is
+  # deliberately not bounded by it: a `git clone` or an SSE stream runs long
+  # on the way back, and that is the traffic this proxy exists for.
+  @request_read_timeout 300_000
 
   # How long the handler waits for the relay to emit the terminal events
   # for requests that never got an answer. A telemetry event is not worth
@@ -99,7 +133,8 @@ defmodule Managoat.Broker.Proxy do
       allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, false),
       upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
       max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
-      max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity)
+      max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity),
+      request_read_timeout: Keyword.get(opts, :request_read_timeout, @request_read_timeout)
     }
 
     serve_client(socket, "", state, @auth_attempts)
@@ -109,7 +144,7 @@ defmodule Managoat.Broker.Proxy do
   # Recurses only on `{:retry, _}`, which is a client coming back with a
   # credential after a `407`; every other outcome ends the connection.
   defp serve_client(socket, buffer, state, attempts) do
-    with {:ok, head, rest} <- read_head(socket, buffer, @head_timeout),
+    with {:ok, head, rest, deadline} <- read_head(socket, buffer, nil, state),
          {:ok, session} <- authenticate(socket, head, rest, attempts, state),
          {:ok, {host, port}, target} <- destination(socket, head) do
       case head.method do
@@ -124,7 +159,7 @@ defmodule Managoat.Broker.Proxy do
           end
 
         _ ->
-          forward_plain(socket, head, rest, host, port, target, session, state)
+          forward_plain(socket, head, rest, {host, port, target}, session, state, deadline)
       end
     else
       {:retry, rest} -> serve_client(socket, rest, state, attempts - 1)
@@ -141,21 +176,84 @@ defmodule Managoat.Broker.Proxy do
 
   defp reachable?(_session, _host, _port), do: true
 
-  defp read_head(socket, buffer, timeout) do
+  # The head, and the deadline the rest of this request is read under. The
+  # deadline starts with the request's first byte rather than with the
+  # connection: waiting for a client to send anything at all is idle time,
+  # bounded by `@head_timeout`, and a proxy connection held open between
+  # requests is doing what a proxy connection is for.
+  #
+  # There is no session here — authentication reads this head — so an
+  # expiry is answered and closed without a request event. There is nothing
+  # to attribute one to, as on any unauthenticated connection.
+  defp read_head(socket, buffer, deadline, state) do
+    deadline = started(buffer, deadline, state.request_read_timeout)
+
     case HTTP.parse_request(buffer) do
       {:ok, head, rest} ->
-        {:ok, head, rest}
+        {:ok, head, rest, deadline}
 
       {:error, reason} ->
         reply(socket, 400, "Bad Request")
         {:error, reason}
 
       {:more, _} ->
-        case Socket.recv(socket, 0, timeout) do
-          {:ok, data} -> read_head(socket, buffer <> data, timeout)
-          {:error, reason} -> {:error, reason}
+        case recv_bounded(&Socket.recv(socket, 0, &1), deadline, @head_timeout) do
+          {:ok, data} ->
+            read_head(socket, buffer <> data, deadline, state)
+
+          {:error, :request_timeout} ->
+            reply(socket, 408, "Request Timeout")
+            {:error, :request_timeout}
+
+          {:error, reason} ->
+            {:error, reason}
         end
     end
+  end
+
+  # When the request being read has to be finished by. `nil` until its first
+  # byte arrives, and `nil` for good when the host turned the bound off.
+  defp started(_buffer, deadline, _timeout) when not is_nil(deadline), do: deadline
+  defp started(_buffer, _deadline, :infinity), do: nil
+  defp started("", _deadline, _timeout), do: nil
+
+  defp started(_buffer, _deadline, timeout),
+    do: System.monotonic_time(:millisecond) + timeout
+
+  # One read, bounded by the request deadline as well as by the idle window
+  # that would have applied anyway. `recv` takes the timeout to use, so the
+  # three call sites keep their own socket and their own module.
+  #
+  # A read the deadline shortened comes back as `{:error, :timeout}` like
+  # any other, so the deadline is checked again before that is believed:
+  # otherwise the one thing this exists to report would be reported as a
+  # stalled client.
+  defp recv_bounded(recv, nil, idle), do: recv.(idle)
+
+  defp recv_bounded(recv, deadline, idle) do
+    case recv.(recv_window(deadline, idle)) do
+      {:error, :timeout} -> timed_out(deadline)
+      other -> other
+    end
+  end
+
+  # Which of the two windows just closed. Only the deadline is worth a
+  # name: an idle client is reported as one, as it always was.
+  defp timed_out(deadline) do
+    if deadline - System.monotonic_time(:millisecond) <= 0,
+      do: {:error, :request_timeout},
+      else: {:error, :timeout}
+  end
+
+  # How long the next read may block: never past the deadline, never longer
+  # than the idle window that would have applied anyway. Zero once the
+  # deadline has passed, which makes that read a poll that returns at once
+  # and lands on `timed_out/1` with the answer.
+  defp recv_window(deadline, idle) do
+    deadline
+    |> Kernel.-(System.monotonic_time(:millisecond))
+    |> min(idle)
+    |> max(0)
   end
 
   defp authenticate(socket, head, rest, attempts, state) do
@@ -279,7 +377,8 @@ defmodule Managoat.Broker.Proxy do
             port: port,
             session: session,
             relay: relay,
-            max_request_bytes: state.max_request_bytes
+            max_request_bytes: state.max_request_bytes,
+            request_read_timeout: state.request_read_timeout
           }
 
           reason = serve(conn, "")
@@ -547,7 +646,11 @@ defmodule Managoat.Broker.Proxy do
   # Sandbox → upstream, one request at a time: head rewritten, body copied.
   # Returns why the loop ended, which is the reason any request still
   # awaiting a response gets.
-  defp serve(conn, buffer) do
+  defp serve(conn, buffer), do: serve(conn, buffer, nil)
+
+  defp serve(conn, buffer, deadline) do
+    deadline = started(buffer, deadline, conn.request_read_timeout)
+
     case HTTP.parse_request(buffer) do
       {:ok, head, rest} ->
         framing = HTTP.body_framing(head)
@@ -559,13 +662,28 @@ defmodule Managoat.Broker.Proxy do
           reply(conn.client, 413, "Content Too Large", [{"connection", "close"}])
           :client_closed
         else
-          serve_injected(conn, head, rest, framing)
+          serve_injected(conn, head, rest, framing, deadline)
         end
 
       {:more, _} ->
-        case :ssl.recv(conn.client, 0, @idle_timeout) do
-          {:ok, data} -> serve(conn, buffer <> data)
-          {:error, _} -> :client_closed
+        case recv_bounded(&:ssl.recv(conn.client, 0, &1), deadline, @idle_timeout) do
+          {:ok, data} ->
+            serve(conn, buffer <> data, deadline)
+
+          # A head that never finished. There is a session and a
+          # destination but no method and no path, so the event carries
+          # what is known and leaves the rest nil — one terminal event, as
+          # every refusal gets.
+          {:error, :request_timeout} ->
+            conn.session
+            |> pending_request(%{method: nil, target: nil}, conn.host, {:error, :denied})
+            |> emit(408, :request_timeout)
+
+            reply(conn.client, 408, "Request Timeout", [{"connection", "close"}])
+            :client_closed
+
+          {:error, _} ->
+            :client_closed
         end
 
       {:error, _} ->
@@ -574,7 +692,7 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
-  defp serve_injected(conn, head, rest, framing) do
+  defp serve_injected(conn, head, rest, framing, deadline) do
     case Injector.inject(head.headers, conn.host, conn.port, head.target, conn.session) do
       {:ok, headers, target, rule} ->
         # `head` is the target the client sent; `target` is the one to
@@ -589,15 +707,16 @@ defmodule Managoat.Broker.Proxy do
         encoded = HTTP.encode_request(%{head | headers: headers}, target)
 
         with :ok <- :ssl.send(conn.upstream, encoded),
-             {:ok, rest} <-
-               copy_body(conn.client, conn.upstream, framing, rest, conn.max_request_bytes) do
+             {:ok, rest} <- copy_body(conn, framing, rest, deadline) do
           if upgrade?(head),
             do: pipe(conn.client, conn.upstream, rest),
             else: serve(conn, rest)
         else
           # The relay holds this request; it emits with the reason
-          # `stop_relay/2` passes on.
-          {:error, :request_too_large} -> :request_too_large
+          # `stop_relay/2` passes on. Nothing is written back for either of
+          # these: the origin already holds a partial body, so there is
+          # nothing honest left to say to the client.
+          {:error, reason} when reason in [:request_too_large, :request_timeout] -> reason
           {:error, _} -> :upstream_send_failed
         end
 
@@ -645,19 +764,23 @@ defmodule Managoat.Broker.Proxy do
   defp within?(_count, :infinity), do: true
   defp within?(count, limit), do: count <= limit
 
-  defp copy_body(client, upstream, framing, buffer, limit) do
-    copy_body(client, upstream, framing, buffer, limit, 0)
+  defp copy_body(conn, framing, buffer, deadline) do
+    copy_body(conn, framing, buffer, deadline, 0)
   end
 
   # `count` is the bytes forwarded so far. For a chunked body those include
   # the chunk framing, which the proxy forwards verbatim, so the cap is
   # very slightly conservative — deliberately, since the alternative is
   # parsing a body this proxy has no business reading.
-  defp copy_body(client, upstream, framing, buffer, limit, count) do
+  #
+  # The deadline is the other bound, and it is the one a drip trips: each
+  # `recv` here is allowed to wait the idle window, so a client sending one
+  # byte at a time never times out on any single read.
+  defp copy_body(conn, framing, buffer, deadline, count) do
     case HTTP.take_body(framing, buffer) do
       {:done, bytes, rest} ->
-        if within?(count + byte_size(bytes), limit) do
-          send_upstream(upstream, bytes)
+        if within?(count + byte_size(bytes), conn.max_request_bytes) do
+          send_upstream(conn.upstream, bytes)
           {:ok, rest}
         else
           {:error, :request_too_large}
@@ -666,15 +789,14 @@ defmodule Managoat.Broker.Proxy do
       {:partial, bytes, framing} ->
         count = count + byte_size(bytes)
 
-        if within?(count, limit) do
-          send_upstream(upstream, bytes)
-
-          case :ssl.recv(client, 0, @idle_timeout) do
-            {:ok, data} -> copy_body(client, upstream, framing, data, limit, count)
-            {:error, reason} -> {:error, reason}
-          end
+        with true <- within?(count, conn.max_request_bytes),
+             :ok <- send_upstream(conn.upstream, bytes),
+             {:ok, data} <-
+               recv_bounded(&:ssl.recv(conn.client, 0, &1), deadline, @idle_timeout) do
+          copy_body(conn, framing, data, deadline, count)
         else
-          {:error, :request_too_large}
+          false -> {:error, :request_too_large}
+          {:error, reason} -> {:error, reason}
         end
     end
   end
@@ -705,7 +827,7 @@ defmodule Managoat.Broker.Proxy do
   # ---------------------------------------------------------------------------
   # Absolute-form: one plain-HTTP request, its response, then close
 
-  defp forward_plain(socket, head, rest, host, port, target, session, state) do
+  defp forward_plain(socket, head, rest, {host, port, target}, session, state, deadline) do
     framing = HTTP.body_framing(head)
 
     with false <- oversized_plain(socket, session, head, host, framing, state),
@@ -731,11 +853,18 @@ defmodule Managoat.Broker.Proxy do
       encoded = HTTP.encode_request(%{head | headers: headers}, target)
 
       with :ok <- :gen_tcp.send(upstream, encoded),
-           :ok <- copy_body_plain(socket, upstream, framing, rest, state.max_request_bytes) do
+           :ok <-
+             copy_body_plain(
+               socket,
+               upstream,
+               framing,
+               {state.max_request_bytes, deadline},
+               rest
+             ) do
         pump_plain(upstream, socket, framer, state.max_response_bytes)
       else
-        {:error, :request_too_large} ->
-          finish_relay(framer, &Response.failed(&1, :request_too_large))
+        {:error, reason} when reason in [:request_too_large, :request_timeout] ->
+          finish_relay(framer, &Response.failed(&1, reason))
 
         {:error, _} ->
           finish_relay(framer, &Response.failed(&1, :upstream_send_failed))
@@ -806,11 +935,13 @@ defmodule Managoat.Broker.Proxy do
   defp family(address) when tuple_size(address) == 8, do: :inet6
   defp family(_address), do: :inet
 
-  defp copy_body_plain(client, upstream, framing, buffer, limit) do
-    copy_body_plain(client, upstream, framing, buffer, limit, 0)
+  defp copy_body_plain(client, upstream, framing, bounds, buffer) do
+    copy_body_plain(client, upstream, framing, bounds, buffer, 0)
   end
 
-  defp copy_body_plain(client, upstream, framing, buffer, limit, count) do
+  # As `copy_body/5` inside a tunnel: the cap bounds how much of a body the
+  # proxy will forward, the deadline how long it will spend reading one.
+  defp copy_body_plain(client, upstream, framing, {limit, deadline} = bounds, buffer, count) do
     case HTTP.take_body(framing, buffer) do
       {:done, bytes, _rest} ->
         if within?(count + byte_size(bytes), limit) do
@@ -823,18 +954,19 @@ defmodule Managoat.Broker.Proxy do
       {:partial, bytes, framing} ->
         count = count + byte_size(bytes)
 
-        if within?(count, limit) do
-          if bytes != "", do: :gen_tcp.send(upstream, bytes)
-
-          case Socket.recv(client, 0, @idle_timeout) do
-            {:ok, data} -> copy_body_plain(client, upstream, framing, data, limit, count)
-            {:error, reason} -> {:error, reason}
-          end
+        with true <- within?(count, limit),
+             :ok <- plain_send(upstream, bytes),
+             {:ok, data} <- recv_bounded(&Socket.recv(client, 0, &1), deadline, @idle_timeout) do
+          copy_body_plain(client, upstream, framing, bounds, data, count)
         else
-          {:error, :request_too_large}
+          false -> {:error, :request_too_large}
+          {:error, reason} -> {:error, reason}
         end
     end
   end
+
+  defp plain_send(_upstream, ""), do: :ok
+  defp plain_send(upstream, bytes), do: :gen_tcp.send(upstream, bytes)
 
   # As in a tunnel: every byte reaches the sandbox first, and the same
   # bytes are then shown to the framer, which only works out when the
@@ -991,8 +1123,9 @@ defmodule Managoat.Broker.Proxy do
   defp refusal_status({:credential_missing, _rule, _scheme}), do: 502
   defp refusal_status(_reason), do: 403
 
+  # The two a refused request can carry. A `413` is written where the size
+  # is checked, which is before any of this.
   defp status_reason(403), do: "Forbidden"
-  defp status_reason(413), do: "Content Too Large"
   defp status_reason(502), do: "Bad Gateway"
 
   defp emit_finished({request, status, error}), do: emit(request, status, error)
@@ -1050,6 +1183,8 @@ defmodule Managoat.Broker.Proxy do
   #
   # `CONNECT` names an authority, not a path, and an authority has no query
   # to leak, so it is reported as it was sent.
+  # A head that never finished has no target to narrow.
+  defp path_only(%{target: nil}), do: nil
   defp path_only(%{method: "CONNECT", target: target}), do: target
   defp path_only(%{target: "http://" <> _ = target}), do: URI.parse(target).path || "/"
 

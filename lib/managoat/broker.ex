@@ -45,6 +45,7 @@ defmodule Managoat.Broker do
   | `upstream_ssl_options` | default `[]`. Merged over the `:ssl` options the proxy dials origins with (a test origin's `cacerts`) |
   | `max_request_bytes` | default 1 GiB. The largest request body the proxy will forward; `:infinity` for none |
   | `max_response_bytes` | default `:infinity`. The largest response body the proxy will relay |
+  | `request_read_timeout` | default 5 minutes, in milliseconds. The wall clock the proxy will spend reading one request, head and body; `:infinity` for none. It does not bound the response |
   | `name` | default `Managoat.Broker`. The supervisor's name; `port/1`, `running?/1` and `ca_pem/1` take it |
 
   The root certificate the sandbox must trust is `ca_pem/1` once the
@@ -97,14 +98,19 @@ defmodule Managoat.Broker do
            [
              port: Keyword.fetch!(opts, :port),
              handler_module: Proxy,
-             handler_options: [
-               store: Keyword.fetch!(opts, :store),
-               certs: certs,
-               allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, false),
-               upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
-               max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
-               max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity)
-             ],
+             # `request_read_timeout` is passed through rather than defaulted
+             # here: it belongs with the other timeouts, which are constants
+             # in `Managoat.Broker.Proxy`, and a default in both places is a
+             # default that will disagree with itself one day.
+             handler_options:
+               [
+                 store: Keyword.fetch!(opts, :store),
+                 certs: certs,
+                 allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, false),
+                 upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
+                 max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
+                 max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity)
+               ] ++ Keyword.take(opts, [:request_read_timeout]),
              read_timeout: @idle_timeout,
              supervisor_options: [name: listener_name(name)]
            ]
