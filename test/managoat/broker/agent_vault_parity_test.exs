@@ -256,7 +256,6 @@ defmodule Managoat.Broker.AgentVaultParityTest do
   # - TestMITM*RateLimit* (auth-failure rate limiting on the proxy port).
   # - TestResponseLimit* / TestRequestBodyCap* (body size caps; Agent Vault's
   #   response cap was unlimited by default too).
-  # - TestMITMForwardIPv6PreservesHostHeader: the proxy resolves IPv4 only.
   # - TestMITMPortBasedRouting, TestMITMAmbiguousAgentVault: Agent Vault's
   #   multi-vault selection, which a per-conversation token makes moot.
   # - TestMITMVaultHintMismatch: Agent Vault refused a valid token presented

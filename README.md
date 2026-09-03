@@ -44,6 +44,14 @@ ingress's job) speaking the two things a forward proxy speaks:
 - **Absolute-form requests** (`GET http://host/path`) for plain HTTP, one
   request per connection.
 
+Either form may name an IPv6 literal, bracketed: `CONNECT [::1]:8443` and
+`GET http://[::1]:8080/x`. Names are resolved over A *and* AAAA, and the
+vetted addresses are dialed IPv4 first — every host that worked before
+takes the address it took before, and IPv6 is a path for hosts that
+previously had none. A leaf for a literal carries an `iPAddress` SAN
+rather than a `dNSName` one, so it validates as a client verifying an
+address expects.
+
 The client authenticates with `Proxy-Authorization: Basic
 base64(token:label)`, which is what an HTTP client sends for a proxy URL
 with userinfo. The token is looked up once per client connection (the unit
@@ -52,12 +60,18 @@ origin. A missing, unknown or expired token is `407`.
 
 Two guards protect the operator's network and the tenant's intent:
 
-- **SSRF.** An origin that resolves to a private, loopback, link-local
-  (including the cloud metadata address), CGNAT or unspecified IPv4 address
-  is refused with `403` before any connection, and the dial goes to the
-  vetted address rather than the name, so a rebinding DNS answer between
-  check and dial changes nothing. `allow_private_upstreams: true` turns the
-  guard off for a test rig whose origins are on localhost.
+- **SSRF.** An origin that resolves into a private, loopback, link-local
+  (including the cloud metadata address), CGNAT, unique-local, multicast or
+  unspecified address is refused with `403` before any connection, in both
+  address families, and the dial goes to a vetted address rather than the
+  name, so a rebinding DNS answer between check and dial changes nothing.
+  **Every** answer is vetted and one blocked answer refuses the host, so
+  the decision never depends on resolver ordering. The IPv6 forms that
+  embed an IPv4 address — `::ffff:`, `::`, `2002:` and `64:ff9b::` — are
+  decoded and judged by the IPv4 policy, since each is otherwise a spelling
+  of a blocked address that a range check would call public.
+  `allow_private_upstreams: true` turns the guard off for a test rig whose
+  origins are on localhost.
 - **`deny`.** A session whose `unmatched_host_policy` is `:deny` refuses a
   host no rule names at `CONNECT`, before a tunnel or handshake exists, and
   refuses a request no rule matches inside a tunnel with `403`. That is how
@@ -84,8 +98,9 @@ map, for the library's tests and for a consumer without a database.
 A `Managoat.Broker.Session` has `rules`, `unmatched_host_policy`
 (`:passthrough` or `:deny`), `expires_at` and an opaque `meta` map the host
 fills for its own logging. A `Managoat.Broker.Rule` has a `pattern`
-(`host[:port][/path]`, wildcards allowed), a `scheme` and the fields the
-scheme needs:
+(`host[:port][/path]`, wildcards allowed; an IPv6 literal is bracketed,
+`[::1]` or `[::1]:8443`, since otherwise there is no telling which colon
+is the port separator), a `scheme` and the fields the scheme needs:
 
 | `scheme` | fields | effect on a matched request |
 |---|---|---|
@@ -214,7 +229,6 @@ short:
 - **No auth-failure rate limiting** on the proxy port.
 - **No body-size caps** (Agent Vault's response cap was unlimited by
   default too).
-- **No IPv6 upstreams.** The proxy resolves IPv4 only.
 - **The label half of the proxy credential is not checked.** Agent Vault
   refused a valid token presented with another vault's name. Here the
   random per-session token is the whole binding; the label exists because

@@ -71,6 +71,13 @@ defmodule Managoat.Broker.CA do
   @doc """
   A leaf certificate and key for `host`, signed by `root`, as the
   `[cert: der, key: {:ECPrivateKey, der}]` pair `:ssl` takes.
+
+  A host that is an IP literal gets an `iPAddress` SAN rather than a
+  `dNSName` one, in the four or sixteen raw octets RFC 5280 asks for. A
+  client verifying a literal looks for that and nothing else, so a leaf for
+  `[::1]` with a DNS SAN of `"::1"` fails verification with a message
+  about the name, which is a confusing way to learn the proxy issued the
+  wrong kind of certificate.
   """
   @spec leaf(String.t(), root()) :: [cert: binary(), key: {:ECPrivateKey, binary()}]
   def leaf(host, {ca_cert, ca_key}) when is_binary(host) do
@@ -89,10 +96,30 @@ defmodule Managoat.Broker.CA do
       |> X509.Certificate.new("/CN=#{host}", ca_cert, ca_key,
         template: :server,
         validity: validity,
-        extensions: [subject_alt_name: X509.Certificate.Extension.subject_alt_name([host])]
+        extensions: [subject_alt_name: X509.Certificate.Extension.subject_alt_name([san(host)])]
       )
 
     [cert: X509.Certificate.to_der(cert), key: {:ECPrivateKey, X509.PrivateKey.to_der(key)}]
+  end
+
+  # `X509.Certificate.Extension.subject_alt_name/1` passes an entry straight
+  # through to the encoder, so `iPAddress` has to arrive as the address's
+  # own octets — four for IPv4, sixteen for IPv6 — not as its text. They go
+  # as a byte list rather than a binary because that is what the library's
+  # `san_value()` type allows, and the ASN.1 encoder writes the same OCTET
+  # STRING either way. A bare string is a `dNSName`, which is right for
+  # everything else.
+  defp san(host) do
+    case :inet.parse_address(String.to_charlist(host)) do
+      {:ok, address} -> {:iPAddress, address_octets(address)}
+      {:error, _} -> host
+    end
+  end
+
+  defp address_octets({a, b, c, d}), do: [a, b, c, d]
+
+  defp address_octets({a, b, c, d, e, f, g, h}) do
+    Enum.flat_map([a, b, c, d, e, f, g, h], &[div(&1, 256), rem(&1, 256)])
   end
 
   # HKDF-SHA256 over the seed, reduced into the curve's scalar field. The
