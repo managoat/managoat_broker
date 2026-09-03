@@ -325,9 +325,12 @@ defmodule Managoat.Broker.Proxy do
     case HTTP.parse_request(buffer) do
       {:ok, head, rest} ->
         case Injector.inject(head.headers, host, port, head.target, session) do
-          {:ok, headers, rule} ->
+          {:ok, headers, target, rule} ->
+            # `head` is the target the client sent; `target` is the one to
+            # forward. Telemetry is derived from the former, so a
+            # substituted credential is never what gets logged.
             log_request(session, head, host, {:ok, rule})
-            request = HTTP.encode_request(%{head | headers: headers}, head.target)
+            request = HTTP.encode_request(%{head | headers: headers}, target)
 
             with :ok <- :ssl.send(upstream, request),
                  {:ok, rest} <- copy_body(client, upstream, HTTP.body_framing(head), rest) do
@@ -338,8 +341,8 @@ defmodule Managoat.Broker.Proxy do
               {:error, _} -> :close
             end
 
-          {:error, :denied} ->
-            log_request(session, head, host, {:error, :denied})
+          {:error, reason} ->
+            log_refused_request(session, head, host, reason)
             reply(client, 403, "Forbidden", [{"connection", "close"}])
             :close
         end
@@ -399,7 +402,8 @@ defmodule Managoat.Broker.Proxy do
   # Absolute-form: one plain-HTTP request, its response, then close
 
   defp forward_plain(socket, head, rest, host, port, target, session, state) do
-    with {:ok, headers, rule} <- inject_or_deny(socket, head, host, port, target, session),
+    with {:ok, headers, target, rule} <-
+           inject_or_deny(socket, head, host, port, target, session),
          {:ok, address} <- resolve(socket, host, port, state),
          {:ok, upstream} <- connect_plain(socket, address, host, port) do
       log_request(session, head, host, {:ok, rule})
@@ -432,11 +436,11 @@ defmodule Managoat.Broker.Proxy do
 
   defp inject_or_deny(socket, head, host, port, target, session) do
     case Injector.inject(head.headers, host, port, target, session) do
-      {:ok, _, _} = ok ->
+      {:ok, _, _, _} = ok ->
         ok
 
-      {:error, :denied} ->
-        log_request(session, head, host, {:error, :denied})
+      {:error, reason} ->
+        log_refused_request(session, head, host, reason)
         reply(socket, 403, "Forbidden")
         {:error, :denied}
     end
@@ -537,6 +541,24 @@ defmodule Managoat.Broker.Proxy do
       rule: rule,
       meta: meta
     })
+  end
+
+  # A request the injector refused. Both reasons are a `403` and a
+  # `:denied` event; they differ in who has to fix it, so the operator's
+  # one says so in a log line. The rule's name, never its credential.
+  defp log_refused_request(session, head, host, reason) do
+    case reason do
+      {:unsafe_credential, rule} ->
+        Logger.warning(
+          "broker: rule #{inspect(rule)} cannot be substituted into a request target: " <>
+            "its credential holds a control character or a space"
+        )
+
+      _ ->
+        :ok
+    end
+
+    log_request(session, head, host, {:error, :denied})
   end
 
   # One event per connection the proxy decides about, whatever it decided,

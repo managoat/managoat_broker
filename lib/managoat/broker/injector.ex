@@ -13,7 +13,28 @@ defmodule Managoat.Broker.Injector do
 
   Several rules may match. The first matched rule that sets a header is the
   one that does (a host's rules are in the order the host declared them);
-  every matched `:substitute` rule applies to the header values.
+  every matched `:substitute` rule applies, in that order, to the header
+  values *and* to the request target.
+
+  ## Substitution and the request target
+
+  A `:substitute` rule reaches the target as well as the headers, so a
+  credential a client puts in the URL — the bot API shape,
+  `/bot<token>/sendMessage`, or an `?key=` a runtime fills in — is brokered
+  like any other. A tenant declares its placeholder and nothing more; it
+  does not have to tell the proxy where the client put it.
+
+  Rules are matched against the target the client sent, and the rewritten
+  target is only what gets forwarded. Telemetry is derived from the
+  original, so a placeholder in a path is logged as the placeholder and a
+  placeholder in a query is not logged at all (`Managoat.Broker.Proxy`
+  drops queries from the event).
+
+  The credential replaces the placeholder byte for byte: nothing is
+  percent-encoded on the way in and nothing is decoded. A credential that
+  could not appear in a request target at all — one holding a control
+  character or a space, which would split the request line — is refused
+  instead, as `{:error, {:unsafe_credential, rule_name}}`.
   """
 
   alias Managoat.Broker.{Rule, Session}
@@ -24,34 +45,49 @@ defmodule Managoat.Broker.Injector do
   @type header :: {String.t(), String.t()}
 
   @doc """
-  Rewrite `headers` for a request to `host`:`port` at `path`. Returns
-  `{:ok, headers, rule_name}` with the name of the first matched rule
-  (`nil` for passthrough), or `{:error, :denied}`.
+  Rewrite `headers` and the request `target` for a request to
+  `host`:`port`. Returns `{:ok, headers, target, rule_name}` with the
+  target to forward and the name of the first matched rule (`nil` for
+  passthrough), `{:error, :denied}`, or `{:error, {:unsafe_credential,
+  rule_name}}` when a credential could not be written into the target.
+
+  `target` is the request target as the client sent it, origin-form
+  (`/path?query`). Rules match against it unchanged; the returned target
+  is the one to forward, which differs only where a `:substitute` rule
+  applied.
   """
   @spec inject([header()], String.t(), :inet.port_number(), String.t(), Session.t()) ::
-          {:ok, [header()], String.t() | nil} | {:error, :denied}
-  def inject(headers, host, port, path, %Session{} = session) do
+          {:ok, [header()], String.t(), String.t() | nil}
+          | {:error, :denied}
+          | {:error, {:unsafe_credential, String.t() | nil}}
+  def inject(headers, host, port, target, %Session{} = session) do
     headers = Enum.reject(headers, fn {k, _} -> String.downcase(k) in @hop_by_hop end)
 
-    case Enum.filter(session.rules, &matches?(&1.pattern, host, port, path)) do
+    case Enum.filter(session.rules, &matches?(&1.pattern, host, port, target)) do
       [] ->
         if session.unmatched_host_policy == :deny,
           do: {:error, :denied},
-          else: {:ok, headers, nil}
+          else: {:ok, headers, target, nil}
 
       [first | _] = matched ->
-        headers =
-          matched
-          |> Enum.filter(&(&1.scheme == :substitute))
-          |> Enum.reduce(headers, &substitute/2)
+        substitutions = Enum.filter(matched, &(&1.scheme == :substitute))
 
-        headers =
-          case Enum.find(matched, &(&1.scheme not in [:substitute, :passthrough])) do
-            nil -> headers
-            rule -> put_auth(headers, rule)
-          end
+        case unsafe_in_target(substitutions, target) do
+          nil ->
+            headers = Enum.reduce(substitutions, headers, &substitute_headers/2)
+            target = Enum.reduce(substitutions, target, &substitute_target/2)
 
-        {:ok, headers, first.name}
+            headers =
+              case Enum.find(matched, &(&1.scheme not in [:substitute, :passthrough])) do
+                nil -> headers
+                rule -> put_auth(headers, rule)
+              end
+
+            {:ok, headers, target, first.name}
+
+          rule ->
+            {:error, {:unsafe_credential, rule.name}}
+        end
     end
   end
 
@@ -126,12 +162,52 @@ defmodule Managoat.Broker.Injector do
     end)
   end
 
-  defp substitute(%Rule{placeholder: placeholder, credential: value}, headers)
+  defp substitute_headers(%Rule{placeholder: placeholder, credential: value}, headers)
        when is_binary(placeholder) and placeholder != "" and is_binary(value) do
     Enum.map(headers, fn {k, v} -> {k, String.replace(v, placeholder, value)} end)
   end
 
-  defp substitute(_rule, headers), do: headers
+  defp substitute_headers(_rule, headers), do: headers
+
+  # The credential goes into the target byte for byte: nothing is
+  # percent-encoded on the way in and nothing is decoded. The proxy cannot
+  # know which URI component a placeholder sits in, nor what encoding the
+  # origin expects, and the canonical case says verbatim is right — a
+  # Telegram bot token is `<digits>:<rest>` in a path segment, where `:` is
+  # legal unencoded and `%3A` would be a different URL. A tenant whose
+  # credential needs percent-encoding declares it already encoded.
+  defp substitute_target(%Rule{placeholder: placeholder, credential: value}, target)
+       when is_binary(placeholder) and placeholder != "" and is_binary(value) do
+    String.replace(target, placeholder, value)
+  end
+
+  defp substitute_target(_rule, target), do: target
+
+  # Verbatim substitution is safe for the reserved characters — `/`, `?`,
+  # `#`, `&`, `=` and the rest change which resource the origin sees, and
+  # choosing the placeholder's position is the tenant's business — but not
+  # for the characters a request target cannot hold at all. A credential
+  # carrying CR or LF would end the request line and start a second
+  # request; a space would end the target and make the rest the HTTP
+  # version. Those are refused rather than encoded, because encoding them
+  # would silently send the origin a credential it cannot use.
+  #
+  # Only rules that actually reach the target are checked: a header value
+  # may legitimately contain a space, and a substitution that never touches
+  # the target must not be refused for it.
+  defp unsafe_in_target(rules, target) do
+    Enum.find(rules, fn
+      %Rule{placeholder: p, credential: v} when is_binary(p) and p != "" and is_binary(v) ->
+        String.contains?(target, p) and not target_safe?(v)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp target_safe?(value) do
+    not String.match?(value, ~r/[\x00-\x20\x7f]/)
+  end
 
   defp replace(headers, name, value) do
     down = String.downcase(name)

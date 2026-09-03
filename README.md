@@ -92,11 +92,22 @@ scheme needs:
 | `:basic` | `credential` as `{username, password}` | `Authorization: Basic base64(username:password)` |
 | `:api_key` | `header` (default `Authorization`), `prefix`, `credential` | `<header>: <prefix><credential>` |
 | `:custom` | `template` (`%{header => "text {{ KEY }}"}`), `credential` (`%{"KEY" => value}`) | each header rendered from its template |
-| `:substitute` | `placeholder`, `credential` | every header value has the placeholder replaced by the credential |
+| `:substitute` | `placeholder`, `credential` | every header value **and the request target** have the placeholder replaced by the credential |
 | `:passthrough` | none | forwarded untouched; under `deny`, how a host is allowed |
 
-The first matched rule that sets a header does; every matched `:substitute`
-rule applies to the header values.
+The first matched rule that sets a header does; every matched
+`:substitute` rule applies, in rule order, to the header values and to the
+request target. A credential goes into the target byte for byte — nothing
+is percent-encoded on the way in, because the proxy cannot know which URI
+component a placeholder sits in nor what the origin expects, and the
+canonical case says so: a bot token is `<digits>:<rest>` in a path
+segment, where `:` is legal unencoded and `%3A` is a different URL. A
+credential holding a control character or a space would split the request
+line, so it is refused with `403` rather than written into a target.
+
+Rules match against the target the client sent, and telemetry is derived
+from that same original, so a placeholder in a path is logged as the
+placeholder and one in a query is not logged at all.
 
 ## The child spec
 
@@ -165,10 +176,10 @@ short:
   adds `Connection: close` upstream and closes after the response. HTTPS
   tunnels keep-alive normally. Plain HTTP through the proxy is apt and
   little else.
-- **No path, query or body substitution.** The `:substitute` rule reaches
-  header values only, which covers an inference key a runtime sends as a
-  bearer or an `x-api-key` in a placeholder it was handed. A credential a
-  client puts in a URL is not brokered.
+- **No body substitution.** The `:substitute` rule reaches header values
+  and the request target — a placeholder in a path (`/bot<token>/send`) or
+  a query (`?key=<token>`) is replaced on both the CONNECT and the
+  absolute-form path — but a request body is forwarded as bytes.
 - **No WebSocket frame rewriting.** The upgrade request is injected; the
   frames after it are piped as bytes.
 - **No auth-failure rate limiting** on the proxy port.

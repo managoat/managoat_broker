@@ -24,14 +24,23 @@ defmodule Managoat.Broker.Rule do
   | `:basic` | `credential` (`{username, password}`) | `Authorization: Basic base64(username:password)` |
   | `:api_key` | `header` (default `Authorization`), `prefix` (default `""`), `credential` (binary) | `<header>: <prefix><credential>` replaces that header |
   | `:custom` | `template` (`%{header => "text {{ KEY }}"}`), `credential` (`%{"KEY" => value}`) | each header rendered from its template; a `{{ KEY }}` with no value is left as written |
-  | `:substitute` | `placeholder`, `credential` (binary) | every header *value* has each occurrence of `placeholder` replaced by `credential`; sets no header itself |
+  | `:substitute` | `placeholder`, `credential` (binary) | every header *value* and the request target have each occurrence of `placeholder` replaced by `credential`; sets no header itself |
   | `:passthrough` | none | the request is forwarded untouched; under `deny` this is how a host is allowed |
 
   `:substitute` is the shape for a credential the agent addresses itself
-  (an inference key the runtime sends as `x-api-key`, or as a bearer, in
-  a placeholder it was handed): the proxy does not need to know the header,
-  only the placeholder. It reaches headers only, never the path, query or
-  body, which is one of the deviations from Agent Vault the README lists.
+  (an inference key the runtime sends as `x-api-key`, or as a bearer, in a
+  placeholder it was handed, or a bot token in the URL path): the proxy
+  does not need to know where the credential goes, only the placeholder. It
+  reaches header values and the request target — so both `/bot<token>/send`
+  and `?key=<token>` are brokered — but never a request body, which is one
+  of the deviations from Agent Vault the README lists.
+
+  The credential replaces the placeholder in the target byte for byte: no
+  percent-encoding is added and none is removed, because the proxy cannot
+  know which URI component the placeholder sits in nor what the origin
+  expects. A credential needing percent-encoding is declared already
+  encoded. One holding a control character or a space is refused rather
+  than written into the target, since it would split the request line.
 
   Several rules may match one request. The first matched rule that sets a
   header is the one that does; every matched `:substitute` rule applies.

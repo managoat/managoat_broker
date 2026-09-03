@@ -64,8 +64,15 @@ defmodule Managoat.Broker.InjectorTest do
     {"Accept", "application/json"}
   ]
 
-  defp inject(headers, host, path \\ "/", session \\ @session),
-    do: Injector.inject(headers, host, 443, path, session)
+  # The tests below this are about headers, so they drop the forwarded
+  # target; the target substitution has its own tests at the end, which
+  # call `Injector.inject/5` directly.
+  defp inject(headers, host, path \\ "/", session \\ @session) do
+    case Injector.inject(headers, host, 443, path, session) do
+      {:ok, headers, _target, rule} -> {:ok, headers, rule}
+      other -> other
+    end
+  end
 
   test "a bearer rule replaces the authorization header wholesale" do
     assert {:ok, headers, "github-api"} = inject(@headers, "api.github.com")
@@ -214,5 +221,203 @@ defmodule Managoat.Broker.InjectorTest do
     assert Injector.host_matches?("discord.com/api/*", "discord.com", 443)
     refute Injector.host_matches?("discord.com:8443/api/*", "discord.com", 443)
     refute Injector.host_matches?("api.example.com", "example.com", 443)
+  end
+
+  describe "substitution into the request target" do
+    # The canonical shape a header-only substitution could not broker: a bot
+    # API with the token in the path. Agent Vault shipped a `telegram`
+    # preset for exactly this.
+    @bot %Session{
+      rules: [
+        %Rule{
+          name: "telegram",
+          pattern: "api.telegram.org",
+          scheme: :substitute,
+          placeholder: "__bot_token__",
+          credential: "123456:AAE-real"
+        }
+      ],
+      unmatched_host_policy: :passthrough,
+      expires_at: ~U[2099-01-01 00:00:00Z]
+    }
+
+    defp target(t, session \\ @bot, host \\ "api.telegram.org") do
+      Injector.inject([{"Accept", "*/*"}], host, 443, t, session)
+    end
+
+    test "a placeholder in the path is replaced in the forwarded target" do
+      assert {:ok, _, "/bot123456:AAE-real/sendMessage", "telegram"} =
+               target("/bot__bot_token__/sendMessage")
+    end
+
+    test "a placeholder in the query is replaced too" do
+      assert {:ok, _, "/v1/models?key=123456:AAE-real&alt=sse", "telegram"} =
+               target("/v1/models?key=__bot_token__&alt=sse")
+    end
+
+    test "a placeholder in the target and in a header are both replaced" do
+      assert {:ok, headers, "/bot123456:AAE-real/x", "telegram"} =
+               Injector.inject(
+                 [{"X-Token", "__bot_token__"}],
+                 "api.telegram.org",
+                 443,
+                 "/bot__bot_token__/x",
+                 @bot
+               )
+
+      assert {"X-Token", "123456:AAE-real"} in headers
+    end
+
+    test "a target with no placeholder is forwarded unchanged" do
+      assert {:ok, _, "/getMe", "telegram"} = target("/getMe")
+    end
+
+    test "an unmatched host forwards the target untouched" do
+      assert {:ok, _, "/bot__bot_token__/x", nil} =
+               target("/bot__bot_token__/x", @bot, "example.com")
+    end
+
+    test "several substitute rules apply to the target in rule order" do
+      session = %{
+        @bot
+        | rules: [
+            %Rule{
+              name: "a",
+              pattern: "h.test",
+              scheme: :substitute,
+              placeholder: "__a__",
+              credential: "AA"
+            },
+            %Rule{
+              name: "b",
+              pattern: "h.test",
+              scheme: :substitute,
+              placeholder: "__b__",
+              credential: "BB"
+            }
+          ]
+      }
+
+      assert {:ok, _, "/AA/BB", "a"} = target("/__a__/__b__", session, "h.test")
+    end
+
+    test "a chained placeholder is not re-substituted by a later rule" do
+      # `a` writes a value that contains `b`'s placeholder. Rules apply in
+      # order, so `b` does see it — this test pins that behaviour down
+      # rather than leaving it to be discovered.
+      session = %{
+        @bot
+        | rules: [
+            %Rule{
+              name: "a",
+              pattern: "h.test",
+              scheme: :substitute,
+              placeholder: "__a__",
+              credential: "__b__"
+            },
+            %Rule{
+              name: "b",
+              pattern: "h.test",
+              scheme: :substitute,
+              placeholder: "__b__",
+              credential: "BB"
+            }
+          ]
+      }
+
+      assert {:ok, _, "/BB", "a"} = target("/__a__", session, "h.test")
+    end
+
+    test "matching still uses the original target, not the rewritten one" do
+      # The rule's path prefix is the client's path. If matching ran on the
+      # rewritten target the credential's own bytes could change the answer.
+      session = %{
+        @bot
+        | rules: [
+            %Rule{
+              name: "scoped",
+              pattern: "h.test/bot__bot_token__",
+              scheme: :substitute,
+              placeholder: "__bot_token__",
+              credential: "SECRET"
+            }
+          ]
+      }
+
+      assert {:ok, _, "/botSECRET/x", "scoped"} =
+               target("/bot__bot_token__/x", session, "h.test")
+    end
+
+    test "deny still refuses a path no rule matches, whatever the placeholder" do
+      session = %{
+        @bot
+        | rules: [%Rule{name: "ok", pattern: "h.test/allowed", scheme: :passthrough}],
+          unmatched_host_policy: :deny
+      }
+
+      assert {:error, :denied} = target("/bot__bot_token__/x", session, "h.test")
+      assert {:ok, _, "/allowed/x", "ok"} = target("/allowed/x", session, "h.test")
+    end
+
+    test "reserved characters go into the target verbatim, unencoded" do
+      # A Telegram bot token holds a `:`, which is legal unencoded in a path
+      # segment; `%3A` would be a different URL. The proxy cannot know which
+      # component a placeholder sits in, so it never encodes.
+      session = %{
+        @bot
+        | rules: [
+            %Rule{
+              name: "r",
+              pattern: "h.test",
+              scheme: :substitute,
+              placeholder: "__p__",
+              credential: "a:b/c?d&e=f+g%20h@i"
+            }
+          ]
+      }
+
+      assert {:ok, _, "/x/a:b/c?d&e=f+g%20h@i", "r"} = target("/x/__p__", session, "h.test")
+    end
+
+    test "a credential that would split the request line is refused" do
+      for bad <- ["a\r\nGET /evil HTTP/1.1", "a b", "a\tb", "a\u007fb"] do
+        session = %{
+          @bot
+          | rules: [
+              %Rule{
+                name: "r",
+                pattern: "h.test",
+                scheme: :substitute,
+                placeholder: "__p__",
+                credential: bad
+              }
+            ]
+        }
+
+        assert {:error, {:unsafe_credential, "r"}} = target("/x/__p__", session, "h.test")
+      end
+    end
+
+    test "an unsafe credential is refused only when it reaches the target" do
+      # A space is legal in a header value, so a substitution that never
+      # touches the target must not be refused for one.
+      session = %{
+        @bot
+        | rules: [
+            %Rule{
+              name: "r",
+              pattern: "h.test",
+              scheme: :substitute,
+              placeholder: "__p__",
+              credential: "Signature keyId=\"x\", sig=\"y\""
+            }
+          ]
+      }
+
+      assert {:ok, headers, "/x", "r"} =
+               Injector.inject([{"Authorization", "__p__"}], "h.test", 443, "/x", session)
+
+      assert {"Authorization", "Signature keyId=\"x\", sig=\"y\""} in headers
+    end
   end
 end
