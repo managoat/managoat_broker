@@ -247,6 +247,26 @@ defmodule Managoat.Broker.AgentVaultParityTest do
     assert System.convert_time_unit(duration, :native, :millisecond) >= 0
   end
 
+  # TestRequestBodyCap*: v0.39.1 capped request bodies at 1 GiB by default,
+  # refusing an over-long declared length with a 413 before dispatch.
+  # `max_request_bytes` defaults to the same 1 GiB.
+  test "a request body over the cap is refused before the origin is told", ctx do
+    capped = start_rig(max_request_bytes: 16)
+    token = put_session(capped, bearer_session("real-secret"))
+    tls = tunnel(capped, token)
+
+    :ok =
+      :ssl.send(tls, "POST /big HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\r\n")
+
+    {:ok, reply} = :ssl.recv(tls, 0, 5_000)
+    assert reply =~ "HTTP/1.1 413"
+
+    # And the default is the same 1 GiB, so an ordinary body is untouched.
+    tls = tunnel(ctx, ctx.token)
+    :ok = :ssl.send(tls, "POST /ok HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\nhi")
+    assert read_json(tls)["body"] == "hi"
+  end
+
   # Not ported, and each one a decision rather than a backlog item. Agent
   # Vault is deleted from the cluster and from Fountain's codebase, so the
   # A/B that settled the last round — the same request against both
@@ -276,9 +296,6 @@ defmodule Managoat.Broker.AgentVaultParityTest do
   #   that has to get masking, fragmentation, control-frame interleaving
   #   and negotiated compression right before a substitution is correct,
   #   and nothing sends a credential inside a frame today.
-  # - TestResponseLimit* (response-body cap): not a parity gap at all.
-  #   Agent Vault's response cap was unlimited by default, so there is
-  #   nothing to match; a cap would be new protection on its own terms.
   # - TestMITMPortBasedRouting, TestMITMAmbiguousAgentVault: Agent Vault's
   #   multi-vault selection, which a per-conversation token makes moot.
   #
@@ -290,12 +307,6 @@ defmodule Managoat.Broker.AgentVaultParityTest do
   #   on one connection may name different origins, so auth and session
   #   reuse must stay well-defined. No consumer needs it; if one does it
   #   gets its own issue and acceptance tests.
-  # - TestRequestBodyCap* (request-body cap). This one *is* a real parity
-  #   gap: v0.39.1 capped request bodies at 1 GiB by default. This proxy
-  #   streams request bodies rather than materialising them, so the
-  #   memory-exhaustion rationale is weaker, but an authenticated client
-  #   can still occupy a connection indefinitely. Deferred until that
-  #   protection is wanted, and not called parity in the meantime.
   # - TestMITMSubstitutionBody (placeholder rewriting inside a request
   #   body): the `:substitute` rule reaches header values and the request
   #   target, so a credential in a header, a path or a query is brokered,

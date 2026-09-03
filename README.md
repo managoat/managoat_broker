@@ -261,11 +261,6 @@ or from the protocol; it cannot be measured.
   inside a frame today. The simple byte pipe is worth keeping until
   something does.
 
-- **No response-body cap.** Not a parity gap: Agent Vault's response cap
-  was unlimited by default, so there is nothing to match. A cap would be
-  new protection and would need justifying on its own terms, not as
-  parity.
-
 ### Deliberate for now, with a condition attached
 
 - **Absolute-form (plain HTTP) is one request per connection.** The proxy
@@ -280,13 +275,25 @@ or from the protocol; it cannot be measured.
   it. If one does, it gets its own issue and its own acceptance tests
   rather than riding along with something else.
 
-- **No request-body cap.** This one *is* a real parity gap and is named as
-  such: Agent Vault v0.39.1 capped request bodies at 1 GiB by default.
-  This proxy streams request bodies rather than materialising them, so the
-  memory-exhaustion rationale is weaker — but an authenticated client can
-  still occupy a connection indefinitely. It stays deferred until that
-  protection is actually wanted; it is not described as parity in the
-  meantime.
+- **Body caps are configurable, with Agent Vault's defaults.**
+  `max_request_bytes` defaults to 1 GiB, matching Agent Vault's
+  `DefaultMaxRequestBytes`; `max_response_bytes` defaults to `:infinity`,
+  matching its `DefaultMaxResponseBytes` of 0. So a consumer that names
+  neither gets Agent Vault's behaviour.
+
+  A request whose declared `Content-Length` exceeds the cap is refused with
+  `413` before the origin is told anything. A chunked body, which declares
+  no length, is counted as it streams and the connection ends when it
+  passes the cap — the origin already holds a partial body by then, so
+  there is nothing honest left to say. The count includes chunk framing,
+  which makes the cap very slightly conservative rather than parsing a body
+  this proxy has no business reading.
+
+  A response cap can only *end* a response, never prevent one: every byte
+  reaches the sandbox before the framer sees it, which is what keeps a
+  stream a stream. So an over-long response arrives up to roughly the cap
+  and the connection is then torn down. Agent Vault ends the same way, by
+  aborting mid-stream.
 
 - **No body substitution.** The `:substitute` rule reaches header values
   and the request target — a placeholder in a path (`/bot<token>/send`) or

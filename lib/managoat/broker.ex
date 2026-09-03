@@ -43,6 +43,8 @@ defmodule Managoat.Broker do
   | `ca_seed` | 32 bytes the root CA is derived from; the same seed on every replica |
   | `allow_private_upstreams` | default `false`. `true` lets the proxy dial private, loopback and link-local origins, for a test rig only |
   | `upstream_ssl_options` | default `[]`. Merged over the `:ssl` options the proxy dials origins with (a test origin's `cacerts`) |
+  | `max_request_bytes` | default 1 GiB. The largest request body the proxy will forward; `:infinity` for none |
+  | `max_response_bytes` | default `:infinity`. The largest response body the proxy will relay |
   | `name` | default `Managoat.Broker`. The supervisor's name; `port/1`, `running?/1` and `ca_pem/1` take it |
 
   The root certificate the sandbox must trust is `ca_pem/1` once the
@@ -99,7 +101,9 @@ defmodule Managoat.Broker do
                store: Keyword.fetch!(opts, :store),
                certs: certs,
                allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, false),
-               upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, [])
+               upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
+               max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
+               max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity)
              ],
              read_timeout: @idle_timeout,
              supervisor_options: [name: listener_name(name)]

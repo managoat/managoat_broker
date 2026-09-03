@@ -10,6 +10,55 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-03
+
+Body size limits. Closes #12, and with it the last real Agent Vault parity
+gap (row 8a of #5).
+
+### Added
+
+- **`max_request_bytes`**, defaulting to **1 GiB** — Agent Vault
+  v0.39.1's `DefaultMaxRequestBytes`. A request whose declared
+  `Content-Length` exceeds it is refused with `413` before the origin is
+  told anything, on both request paths. A chunked body declares no length,
+  so it is counted as it streams and the connection ends when it passes
+  the cap; by then the origin holds a partial body, so there is nothing
+  honest left to say to the client. The count includes chunk framing,
+  which makes the cap very slightly conservative — deliberately, since the
+  alternative is parsing a body this proxy has no business reading.
+
+  #5 noted the memory-exhaustion rationale is weaker here, since request
+  bodies stream rather than materialising. The argument that survives is
+  availability, and it is concrete: bodies are read with a five-minute
+  idle timeout per read, so an authenticated client sending one byte every
+  four minutes held a connection open indefinitely. A byte cap bounds
+  that; the idle timeout alone did not.
+
+- **`max_response_bytes`**, defaulting to **`:infinity`** — Agent Vault's
+  `DefaultMaxResponseBytes` of 0. Not a parity gap, so it is opt-in and
+  the default changes nothing.
+
+  A cap here can only *end* a response, never prevent one: every byte
+  reaches the sandbox before the framer sees it, which is what keeps a
+  stream a stream. An over-long response therefore arrives up to roughly
+  the cap and the connection is then torn down. Agent Vault ends the same
+  way, aborting mid-stream.
+
+- Two error atoms on `[:managoat, :broker, :request]`:
+  `:request_too_large` and `:response_too_large`.
+
+- `Managoat.Broker.Response.new/1` takes the response cap, and
+  `halted?/1` says whether framing stopped because one was passed.
+
+### Notes
+
+Both options default rather than being required, a deliberate exception to
+"a configuration key should have no default when the right default is the
+host's business": a body cap's right default is not host-specific, and
+requiring one would break every consumer on upgrade. **A consumer that
+names neither gets Agent Vault's behaviour**, which is the point of
+choosing its numbers.
+
 ## [0.5.0] - 2026-09-03
 
 ### Changed

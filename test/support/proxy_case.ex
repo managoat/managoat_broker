@@ -257,6 +257,8 @@ defmodule Managoat.Broker.ProxyCase do
          store: {Memory, store},
          ca_seed: seed,
          allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, true),
+         max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
+         max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity),
          upstream_ssl_options: [
            cacerts: [X509.Certificate.to_der(origin_ca) | Keyword.get(opts, :extra_cacerts, [])]
          ]
