@@ -242,12 +242,17 @@ defmodule Managoat.Broker.IPv6Test do
     end
 
     test "a name resolving into both families is refused on either answer" do
-      # `localhost` answers 127.0.0.1 *and* ::1 here, so this is the
-      # multi-answer path: every answer is vetted before any dial, and one
-      # blocked answer refuses the host. Checking only the address about to
-      # be dialed would make the refusal depend on resolver ordering.
-      assert {:ok, [{127, 0, 0, 1}]} = :inet.getaddrs(~c"localhost", :inet)
-      assert {:ok, [{0, 0, 0, 0, 0, 0, 0, 1}]} = :inet.getaddrs(~c"localhost", :inet6)
+      # `localhost` answers in both families, so this is the multi-answer
+      # path on the wire: every answer is vetted before any dial, and one
+      # blocked answer refuses the host. What the resolver returns exactly
+      # is the host's business — a runner may list 127.0.0.1 twice — so
+      # this asserts the shape the rule needs, not the answer.
+      {:ok, v4} = :inet.getaddrs(~c"localhost", :inet)
+      {:ok, v6} = :inet.getaddrs(~c"localhost", :inet6)
+      addresses = Enum.uniq(v4 ++ v6)
+
+      assert length(addresses) > 1, "localhost answers once here: #{inspect(addresses)}"
+      assert Proxy.blocked(addresses) == addresses
 
       ctx = start_rig(allow_private_upstreams: false)
       token = put_session(ctx, bearer_session("x"))
