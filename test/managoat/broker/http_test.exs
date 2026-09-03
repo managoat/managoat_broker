@@ -122,4 +122,47 @@ defmodule Managoat.Broker.HTTPTest do
       end
     end
   end
+
+  describe "parse_response/1" do
+    test "a status line, its headers and the bytes after them" do
+      assert {:ok, %{status: 201, reason: "Created", version: {1, 1}, headers: headers}, "body"} =
+               HTTP.parse_response("HTTP/1.1 201 Created\r\nContent-Length: 4\r\n\r\nbody")
+
+      assert {"Content-Length", "4"} in headers
+    end
+
+    test "a head that has not all arrived yet" do
+      assert {:more, "HTTP/1.1 20"} = HTTP.parse_response("HTTP/1.1 20")
+    end
+
+    test "a status line that is not one" do
+      assert {:error, {:bad_status_line, _}} = HTTP.parse_response("nonsense\r\n\r\n")
+    end
+
+    test "a request where a response was expected" do
+      # An origin answering a request with a request is not a response with
+      # a strange status; it is not a response at all.
+      assert {:error, {:unexpected, _}} = HTTP.parse_response("GET / HTTP/1.1\r\n\r\n")
+    end
+  end
+
+  describe "response_framing/3" do
+    test "the method and the status decide before the headers do" do
+      assert :none == HTTP.response_framing(200, [{"Content-Length", "5"}], "HEAD")
+      assert :none == HTTP.response_framing(100, [{"Content-Length", "5"}], "GET")
+      assert :none == HTTP.response_framing(199, [], "GET")
+      assert :none == HTTP.response_framing(204, [{"Content-Length", "5"}], "GET")
+      assert :none == HTTP.response_framing(304, [{"Content-Length", "5"}], "GET")
+    end
+
+    test "otherwise chunked, then content-length, then the close" do
+      assert :chunked == HTTP.response_framing(200, [{"Transfer-Encoding", "chunked"}], "GET")
+      assert {:length, 5} == HTTP.response_framing(200, [{"Content-Length", "5"}], "GET")
+      assert :until_close == HTTP.response_framing(200, [{"Content-Type", "text/html"}], "GET")
+    end
+
+    test "a body ended only by the close always wants more" do
+      assert {:partial, "abc", :until_close} = HTTP.take_body(:until_close, "abc")
+    end
+  end
 end

@@ -1,9 +1,12 @@
 defmodule Managoat.Broker.HTTP do
   @moduledoc """
-  The slice of HTTP/1.1 the proxy has to understand: a request head, and
-  how long the body after it is. Responses are never parsed; they flow back
-  to the sandbox as bytes, which is what keeps a streaming model reply a
-  stream.
+  The slice of HTTP/1.1 the proxy has to understand: a head in either
+  direction, and how long the body after it is.
+
+  Bodies are never interpreted or accumulated. Framing says where one ends
+  so the next head can be found and a request can be told it is over; every
+  byte is relayed as it arrives, which is what keeps a streaming model
+  reply a stream.
   """
 
   @type head :: %{
@@ -13,8 +16,19 @@ defmodule Managoat.Broker.HTTP do
           headers: [{String.t(), String.t()}]
         }
 
-  @typedoc "How the body after a head is delimited."
-  @type framing :: :none | {:length, non_neg_integer()} | :chunked
+  @type response_head :: %{
+          status: 100..599,
+          reason: String.t(),
+          version: {integer(), integer()},
+          headers: [{String.t(), String.t()}]
+        }
+
+  @typedoc """
+  How the body after a head is delimited. `:until_close` is a response
+  with neither a length nor chunked framing: the body is everything up to
+  the close, which is therefore the only end-of-message signal.
+  """
+  @type framing :: :none | {:length, non_neg_integer()} | :chunked | :until_close
 
   @doc """
   Parse a request head off the front of `buffer`. `{:more, buffer}` when the
@@ -71,8 +85,65 @@ defmodule Managoat.Broker.HTTP do
     end
   end
 
+  @doc """
+  Parse a response head off the front of `buffer`. `{:more, buffer}` when
+  the head is not complete yet, `{:ok, head, rest}` with the bytes after
+  the blank line, `{:error, reason}` on garbage. The mirror of
+  `parse_request/1`.
+  """
+  @spec parse_response(binary()) ::
+          {:ok, response_head(), binary()} | {:more, binary()} | {:error, term()}
+  def parse_response(buffer) do
+    case :erlang.decode_packet(:http_bin, buffer, []) do
+      {:ok, {:http_response, version, status, reason}, rest} ->
+        parse_headers(rest, %{
+          status: status,
+          reason: to_string(reason),
+          version: version,
+          headers: []
+        })
+
+      {:ok, {:http_error, line}, _} ->
+        {:error, {:bad_status_line, line}}
+
+      {:ok, other, _} ->
+        {:error, {:unexpected, other}}
+
+      {:more, _} ->
+        {:more, buffer}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc """
+  How the body after a response with `status` and `headers` is delimited,
+  for a request that used `method` (RFC 9112 §6.3).
+
+  The status and the method decide before the headers do: a `HEAD` never
+  has a body however it is framed, and neither does `1xx`, `204` or `304`.
+  A response that is framed by neither `Transfer-Encoding: chunked` nor
+  `Content-Length` runs to the close of the connection, which is then the
+  only signal that it ended.
+  """
+  @spec response_framing(100..599, [{String.t(), String.t()}], String.t()) :: framing()
+  def response_framing(status, headers, method)
+
+  def response_framing(_status, _headers, "HEAD"), do: :none
+  def response_framing(status, _headers, _method) when status in 100..199, do: :none
+  def response_framing(204, _headers, _method), do: :none
+  def response_framing(304, _headers, _method), do: :none
+
+  def response_framing(_status, headers, _method) do
+    case body_framing(%{headers: headers}) do
+      :none -> :until_close
+      framing -> framing
+    end
+  end
+
   @doc "How the request body after `head` is delimited (RFC 9112 §6)."
-  @spec body_framing(head()) :: framing()
+  @spec body_framing(head() | %{headers: [{String.t(), String.t()}]}) :: framing()
   def body_framing(%{headers: headers}) do
     te = header(headers, "transfer-encoding")
     cl = header(headers, "content-length")
@@ -146,11 +217,16 @@ defmodule Managoat.Broker.HTTP do
   body is in hand, `{:partial, consumed, state}` when more is needed and
   `consumed` (the whole buffer) may be forwarded. Chunked bodies are
   forwarded verbatim, framing included; the state remembers where in the
-  chunk stream the buffer ended.
+  chunk stream the buffer ended. `:until_close` is always `{:partial, ...}`
+  — only the close ends it, and the caller turns that into the end.
   """
   @spec take_body(framing() | {:chunked, term()}, binary()) ::
           {:done, binary(), binary()} | {:partial, binary(), framing() | {:chunked, term()}}
   def take_body(:none, buffer), do: {:done, "", buffer}
+
+  # Nothing but the close ends this body, so every byte in hand is body and
+  # more is always wanted. The caller turns the close into `{:done, ...}`.
+  def take_body(:until_close, buffer), do: {:partial, buffer, :until_close}
 
   def take_body({:length, n}, buffer) when byte_size(buffer) >= n do
     <<body::binary-size(n), rest::binary>> = buffer

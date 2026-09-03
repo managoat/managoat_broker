@@ -216,6 +216,37 @@ defmodule Managoat.Broker.AgentVaultParityTest do
     assert echoed["query"] == "key=123456:AAE-real"
   end
 
+  # Agent Vault emitted its request record after `io.Copy` completed, with
+  # a latency measured from handler entry through response-body completion.
+  # This proxy frames responses for the same reason, so its one request
+  # event is terminal too.
+  test "the request event is emitted when the response ends, with its status", ctx do
+    session = attach_request_telemetry(ctx)
+    Memory.put(ctx.store, ctx.token, session)
+
+    tls = tunnel(ctx, ctx.token)
+    stream = "parity_terminal_#{System.unique_integer([:positive])}"
+
+    :ok =
+      :ssl.send(
+        tls,
+        "GET /stream HTTP/1.1\r\nHost: localhost\r\nX-Stream-Name: #{stream}\r\n\r\n"
+      )
+
+    # Agent Vault's latency was total duration, not time to first byte, so
+    # the record does not exist yet even though bytes have arrived.
+    recv_until(tls, "data: first")
+    refute_receive {:request, _, _}, 100
+
+    send(String.to_atom(stream), :continue)
+    recv_until(tls, "data: second")
+
+    assert_receive {:request, %{count: 1, duration: duration},
+                    %{path: "/stream", status: 200, error: nil}}
+
+    assert System.convert_time_unit(duration, :native, :millisecond) >= 0
+  end
+
   # Not ported, on purpose:
   # - TestMITMSubstitutionBody (placeholder rewriting inside a request
   #   body): the `:substitute` rule reaches header values and the request

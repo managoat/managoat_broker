@@ -43,8 +43,20 @@ defmodule Managoat.Broker.ProxyCase do
         5_000 -> :ok
       end
 
-      {:ok, conn} = chunk(conn, "data: second\n\n")
+      # The result is deliberately ignored: a test may have abandoned the
+      # connection before this arrives, which is the case under test there
+      # rather than a failure of the origin.
+      _ = chunk(conn, "data: second\n\n")
       conn
+    end
+
+    # An origin that ends the connection after answering, which is how a
+    # response the proxy must frame by the close arrives, and how the
+    # upstream side of a tunnel closes under the proxy's feet.
+    def call(%{request_path: "/close"} = conn, _opts) do
+      conn
+      |> put_resp_header("connection", "close")
+      |> send_resp(200, "closing")
     end
 
     def call(%{request_path: "/ws"} = conn, _opts) do
@@ -198,6 +210,37 @@ defmodule Managoat.Broker.ProxyCase do
       expires_at: DateTime.add(DateTime.utc_now(), 600, :second),
       meta: meta
     }
+  end
+
+  @doc """
+  Forward this rig's `[:managoat, :broker, :request]` events to the test
+  process as `{:request, measurements, metadata}`, and return the session
+  they will carry.
+
+  Telemetry handlers are global and this suite is async, so an unfiltered
+  handler also sees the events of every other module running beside it —
+  which makes `assert_receive` racy and `refute_receive` meaningless. The
+  session gets a marker unique to this test in its `meta`, and the handler
+  passes on only the events carrying it.
+  """
+  def attach_request_telemetry(ctx) do
+    id = "broker-test-#{System.unique_integer([:positive])}"
+    session = %{ctx.session | meta: Map.put(ctx.session.meta, :test_id, id)}
+    Memory.put(ctx.store, ctx.token, session)
+
+    :telemetry.attach(
+      id,
+      [:managoat, :broker, :request],
+      fn _event, measurements, meta, pid ->
+        if is_map(meta.meta) and Map.get(meta.meta, :test_id) == id do
+          send(pid, {:request, measurements, meta})
+        end
+      end,
+      self()
+    )
+
+    ExUnit.Callbacks.on_exit(fn -> :telemetry.detach(id) end)
+    session
   end
 
   @doc "The `Proxy-Authorization` value for a token and a label."

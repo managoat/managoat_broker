@@ -10,6 +10,66 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-03
+
+This minor bump changes the shape and the timing of the request event; see
+Changed before upgrading. Row 2 of #5.
+
+### Added
+
+- Responses are framed, so `[:managoat, :broker, :request]` can say how a
+  request ended. The event gains `status` and `error` in its metadata and a
+  monotonic `duration` in its measurements, in native time units beside
+  `count` (`System.convert_time_unit/3` turns it into milliseconds).
+  Fountain's `broker_requests` table has had `status`, `latency_ms` and
+  `error` nullable and unwritten, waiting for exactly this.
+
+  `error` is nil on a request that completed, and otherwise one of five
+  documented reasons: `:upstream_send_failed`, `:upstream_read_failed`,
+  `:malformed_response`, `:upstream_closed` or `:client_closed`. A response
+  whose head arrived and whose body then failed carries both its status and
+  its error.
+
+- `Managoat.Broker.Response`, the framer. It handles informational `1xx`
+  before a final response, `HEAD`, `204`, `304`, fixed-length, chunked with
+  trailers, and close-delimited responses, correlates keep-alive and
+  pipelined responses to their requests in order, and hands a `101` back to
+  the existing byte pipe so WebSocket behaviour is unchanged.
+
+- `Managoat.Broker.HTTP.parse_response/1` and `response_framing/3`, the
+  response-side mirror of the request parsing already there, and a
+  `:until_close` framing for a response delimited only by the connection
+  ending.
+
+### Changed
+
+- **The request event is now terminal, and fires later.** It used to be
+  emitted before the request was even sent upstream, which is why it could
+  never carry a status: a telemetry event is a one-shot value. There is
+  still exactly one event per request, on every terminal path, but an
+  upstream response now emits when its body completes or fails, and a
+  refusal the proxy makes itself emits immediately with the status the
+  proxy sent (`403`).
+
+  The consequence to plan for: **a long-lived request is not recorded until
+  it ends**, so a streaming reply reaches a host's audit log when the
+  stream finishes rather than when it starts. That is Agent Vault's
+  total-duration semantics — it emitted after `io.Copy` returned — and it
+  avoids a second event plus a row-update protocol. If immediate visibility
+  for long-lived requests is ever needed, that is correlated start/stop
+  events, not two meanings in one.
+
+- Measurements are `%{count: 1, duration: <native>}` rather than
+  `%{count: 1}`. A handler matching `%{count: 1}` still matches.
+
+### Notes
+
+Framing never gets in the relay's way. Every byte from the origin is
+written to the sandbox the instant it arrives and only then shown to the
+framer, so a streaming reply streams exactly as it did before responses
+were parsed, response bodies are never accumulated, and a framing failure
+costs telemetry rather than the response.
+
 ## [0.2.0] - 2026-09-03
 
 This minor bump carries one breaking change to a public function; see

@@ -36,8 +36,9 @@ ingress's job) speaking the two things a forward proxy speaks:
   *sandbox* using a leaf certificate for that host signed by the listener's
   own CA. Inside the tunnel it reads each request head, rewrites the headers
   per the session's rules, and forwards head and body to the origin. Bytes
-  coming back are relayed untouched and unparsed, so a streaming model reply
-  streams. Keep-alive works; every request on the tunnel is rewritten. A
+  coming back are relayed untouched, so a streaming model reply streams;
+  they are also framed, alongside the relay rather than in front of it, so
+  each request's event can say what status it got and how long it took. Keep-alive works; every request on the tunnel is rewritten. A
   WebSocket upgrade is injected like any other request, after which the
   tunnel is a byte pipe.
 - **Absolute-form requests** (`GET http://host/path`) for plain HTTP, one
@@ -150,12 +151,40 @@ twenty-nine.
 ## Telemetry
 
 Every request the proxy decides about emits `[:managoat, :broker,
-:request]` with `%{count: 1}` and the metadata `method`, `host`, `path`,
-`outcome` (`:injected`, `:passthrough` or `:denied`), `rule` (the matched
-rule's name, or nil) and `meta` (the session's, unchanged). Never a header,
+:request]` with the measurements `%{count: 1, duration: <native units>}`
+and the metadata `method`, `host`, `path`, `outcome` (`:injected`,
+`:passthrough` or `:denied`), `rule` (the matched rule's name, or nil),
+`status`, `error` and `meta` (the session's, unchanged). Never a header,
 never a body. The host attaches a handler and writes its log line with
 whatever `meta` carries; the library logs only refusals, which have no
 session to attribute.
+
+**The event is terminal**: one per request, emitted when the request is
+over rather than when it starts.
+
+- For an upstream response, it fires once the response body has completed
+  or failed. `status` is the status the origin sent; `duration` is
+  monotonic, in native time units (`System.convert_time_unit/3` turns it
+  into milliseconds), and covers the whole request through the end of the
+  response body — not time to first byte.
+- For a refusal the proxy makes itself, it fires immediately, with the
+  status the proxy sent (`403`).
+- `error` is nil when the request completed. Otherwise it is one of
+  `:upstream_send_failed`, `:upstream_read_failed`, `:malformed_response`,
+  `:upstream_closed` or `:client_closed`. A response whose head arrived and
+  whose body then failed carries both its `status` and its `error`.
+
+A consequence worth planning for: **a long-lived request is not recorded
+until it ends**, so a streaming reply appears in a host's audit log when
+the stream finishes. That matches Agent Vault's total-duration semantics
+and avoids a second event and a row-update protocol. If immediate
+visibility for long-lived requests is ever needed, that is correlated
+start/stop events, not more meaning packed into this one.
+
+Framing never touches the relay. Every byte from the origin is written to
+the sandbox the instant it arrives, and only then shown to the framer, so a
+streaming reply streams exactly as it did before responses were parsed and
+a framing failure costs telemetry rather than the response.
 
 `path` is the URL path and nothing else. A query string never appears in
 it, on either request path, because a query can already hold a credential
