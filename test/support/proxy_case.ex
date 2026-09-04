@@ -50,6 +50,14 @@ defmodule Managoat.Broker.ProxyCase do
       conn
     end
 
+    # An origin that plants a cookie, for the deviation the parity suite
+    # pins: `Set-Cookie` reaches the sandbox rather than being stripped.
+    def call(%{request_path: "/cookie"} = conn, _opts) do
+      conn
+      |> put_resp_cookie("session", "planted", http_only: false)
+      |> send_resp(200, "cookie set")
+    end
+
     # An origin that ends the connection after answering, which is how a
     # response the proxy must frame by the close arrives, and how the
     # upstream side of a tunnel closes under the proxy's feet.

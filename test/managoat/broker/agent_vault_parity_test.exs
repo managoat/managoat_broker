@@ -314,6 +314,35 @@ defmodule Managoat.Broker.AgentVaultParityTest do
     end
   end
 
+  # ShouldStripResponseHeader (internal/brokercore/brokercore.go) drops
+  # hop-by-hop headers *and* `Set-Cookie` from every upstream response,
+  # "to prevent the upstream from planting cookies in the agent's jar".
+  # Deliberately not matched — see README.md's deviations — and pinned
+  # here rather than left to a comment: a change that starts rewriting
+  # response heads inside a tunnel would make stripping nearly free, and
+  # this test is what makes it re-read the decision instead of quietly
+  # inheriting it.
+  test "a Set-Cookie from an origin reaches the sandbox, on both paths", ctx do
+    tls = tunnel(ctx, ctx.token)
+    :ok = :ssl.send(tls, "GET /cookie HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+    assert recv_until(tls, "\r\n\r\n") =~ ~r/set-cookie: session=planted/i
+
+    # And on the absolute-form path, which re-emits the head rather than
+    # relaying it: everything but the hop-by-hop headers survives that.
+    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+    :ok =
+      :gen_tcp.send(
+        tcp,
+        "GET http://localhost:#{ctx.http_port}/cookie HTTP/1.1\r\nHost: localhost\r\n" <>
+          "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
+      )
+
+    {head, _body} = read_plain_response(tcp)
+    assert head =~ ~r/set-cookie: session=planted/i
+  end
+
   # Not ported, and each one a decision rather than a backlog item. Agent
   # Vault is deleted from the cluster and from Fountain's codebase, so the
   # A/B that settled the last round — the same request against both
@@ -348,6 +377,12 @@ defmodule Managoat.Broker.AgentVaultParityTest do
   #
   # Divergent for now, with a condition attached:
   #
+  # - ShouldStripResponseHeader's `Set-Cookie` half. Agent Vault dropped it
+  #   from every response so an origin could not plant a cookie in the
+  #   agent's jar; it rebuilt every response head anyway, so the strip was
+  #   free. Here a tunnelled response is relayed byte for byte, and
+  #   stripping would mean parsing and re-emitting every head on the path
+  #   that carries the streams. The test above pins what we do instead.
   # - Upstream connection pooling. Agent Vault ran outbound requests through
   #   Go's `http.Transport`, which pools per host with a 90s idle timeout.
   #   Here the sandbox's connection is kept alive (see
