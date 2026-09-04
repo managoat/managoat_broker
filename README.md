@@ -399,6 +399,29 @@ or from the protocol; it cannot be measured.
   client gives up on its own. If that stops being true it gets its own
   issue.
 
+- **`Set-Cookie` is relayed, where Agent Vault stripped it.** Its
+  `ShouldStripResponseHeader` dropped hop-by-hop headers *and* `Set-Cookie`
+  from every response, "to prevent the upstream from planting cookies in
+  the agent's jar" — a real if small channel: a cookie an origin sets is
+  sent back to it on later requests, from a sandbox that may outlive the
+  task that visited it.
+
+  Agent Vault rebuilt every response head anyway, so the strip cost it
+  nothing. Here a tunnelled response is relayed byte for byte, and
+  stripping means parsing and re-emitting every head on the path that
+  carries the streams — the trade `Managoat.Broker.Response`'s moduledoc
+  sets out, spent for something smaller than it costs. Most agent HTTP
+  clients keep no cookie jar at all, and where one does, a session cookie
+  is sometimes how an origin's own auth works, so stripping could break a
+  flow a `:passthrough` rule was meant to allow.
+
+  The condition: if response heads are ever re-emitted inside a tunnel for
+  another reason, stripping becomes nearly free and this should be revisited
+  rather than inherited. The parity suite pins the current behaviour so that
+  change has to look at this decision. Doing it on the absolute-form path
+  alone — where heads *are* re-emitted — would be half a fix whose asymmetry
+  needed explaining every time anyone noticed it.
+
 - **No body substitution.** The `:substitute` rule reaches header values
   and the request target — a placeholder in a path (`/bot<token>/send`) or
   a query (`?key=<token>`) is replaced on both request paths — but a

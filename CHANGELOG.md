@@ -10,6 +10,26 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-09-03
+
+### Documented
+
+- **`Set-Cookie` is relayed to the sandbox, and that is now a recorded
+  deviation rather than an oversight.** Agent Vault's
+  `ShouldStripResponseHeader` dropped it from every response so an origin
+  could not plant a cookie in the agent's jar; it rebuilt every response
+  head anyway, so the strip was free. Here a tunnelled response is relayed
+  byte for byte, and stripping would mean parsing and re-emitting every
+  head on the path that carries the streams — more than the channel is
+  worth, given most agent HTTP clients keep no jar and a session cookie is
+  sometimes how an origin's own auth works.
+
+  README.md carries the reasoning and the condition attached to it: if
+  heads are ever re-emitted inside a tunnel for another reason, stripping
+  becomes nearly free and should be revisited rather than inherited. The
+  parity suite pins the current behaviour on both paths, so that change has
+  to re-read the decision instead of quietly changing it. Closes #29.
+
 ## [0.10.1] - 2026-09-03
 
 Documentation: what the relay-verbatim property is actually worth, and two
