@@ -44,12 +44,22 @@ defmodule Managoat.Broker.Proxy do
   Every request the proxy decides about emits `[:managoat, :broker,
   :request]` with `%{count: 1, duration: native}` and the metadata
   `method`, `host`, `path`, `outcome` (`:injected`, `:passthrough` or
-  `:denied`), `rule` (the matched rule's name or nil), `status`, `error`
-  and `meta` (the session's, unchanged). Never a header, never a body, and
+  `:denied`), `rule` (the applied rule's name or nil), `scheme` (that
+  rule's scheme, or nil), `status`, `error` and `meta` (the session's,
+  unchanged). Never a header, never a body, and
   `path` is the URL path only — never a query string or a fragment, on
   either request path, because a query can carry a credential the proxy
   never saw. The origin still receives the target unchanged. The host
   attaches a handler and writes its log line.
+
+  `outcome` answers **"did a rule apply"**, not "was a credential
+  attached". `:passthrough` means *no rule matched* and the session's
+  policy let the request through, so it cannot occur under
+  `unmatched_host_policy: :deny`. A matched `:passthrough` rule — how a
+  host is allowed under `deny` — is `:injected` with that rule's name,
+  because a rule did apply, and nothing was attached to the request.
+  `scheme` is what separates the two, and it is the field an audit log
+  should read to say whether a credential went out.
 
   The event is **terminal**: exactly one per request, emitted when the
   request is over. An upstream response emits when its body completes or
@@ -111,7 +121,7 @@ defmodule Managoat.Broker.Proxy do
 
   require Logger
 
-  alias Managoat.Broker.{Certs, HTTP, Injector, Response, Session, Store}
+  alias Managoat.Broker.{Certs, HTTP, Injector, Response, Rule, Session, Store}
   alias ThousandIsland.Socket
 
   @head_timeout 30_000
@@ -1235,11 +1245,16 @@ defmodule Managoat.Broker.Proxy do
   # everything the event will carry except the parts only the ending
   # supplies. Never the headers, never a body.
   defp pending_request(%Session{meta: meta}, head, host, decision) do
-    {outcome, rule} =
+    # `scheme` is the scheme of the rule `rule` names, and it is the field
+    # that says whether a credential was attached: `outcome` answers "did a
+    # rule apply", which a matched `:passthrough` rule does without
+    # attaching anything. A refusal names neither — the proxy decided
+    # against the request rather than for a rule.
+    {outcome, rule, scheme} =
       case decision do
-        {:ok, nil} -> {:passthrough, nil}
-        {:ok, rule} -> {:injected, rule}
-        {:error, _} -> {:denied, nil}
+        {:ok, nil} -> {:passthrough, nil, nil}
+        {:ok, %Rule{} = rule} -> {:injected, rule.name, rule.scheme}
+        {:error, _} -> {:denied, nil, nil}
       end
 
     %{
@@ -1248,6 +1263,7 @@ defmodule Managoat.Broker.Proxy do
       path: path_only(head),
       outcome: outcome,
       rule: rule,
+      scheme: scheme,
       meta: meta,
       started_at: System.monotonic_time()
     }
@@ -1320,6 +1336,7 @@ defmodule Managoat.Broker.Proxy do
         path: request.path,
         outcome: request.outcome,
         rule: request.rule,
+        scheme: request.scheme,
         status: status,
         error: error,
         meta: request.meta

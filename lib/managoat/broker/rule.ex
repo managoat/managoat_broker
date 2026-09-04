@@ -35,6 +35,13 @@ defmodule Managoat.Broker.Rule do
   | `:substitute` | `placeholder`, `credential` (binary) | every header *value* and the request target have each occurrence of `placeholder` replaced by `credential`; sets no header itself |
   | `:passthrough` | none | the request is forwarded untouched; under `deny` this is how a host is allowed |
 
+  A `:passthrough` rule that matches is still a rule applying, so the
+  request event reports it as `outcome: :injected` with this rule's name
+  and `scheme: :passthrough`. `outcome: :passthrough` means the opposite —
+  that *no* rule matched — so the scheme is what an audit log reads to say
+  whether a credential was attached. `Managoat.Broker.Proxy`'s moduledoc
+  has the table.
+
   `:substitute` is the shape for a credential the agent addresses itself
   (an inference key the runtime sends as `x-api-key`, or as a bearer, in a
   placeholder it was handed, or a bot token in the URL path): the proxy

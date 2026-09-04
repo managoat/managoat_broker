@@ -254,11 +254,30 @@ anyone thought to write down.
 Every request the proxy decides about emits `[:managoat, :broker,
 :request]` with the measurements `%{count: 1, duration: <native units>}`
 and the metadata `method`, `host`, `path`, `outcome` (`:injected`,
-`:passthrough` or `:denied`), `rule` (the matched rule's name, or nil),
-`status`, `error` and `meta` (the session's, unchanged). Never a header,
-never a body. The host attaches a handler and writes its log line with
-whatever `meta` carries; the library logs only refusals, which have no
-session to attribute.
+`:passthrough` or `:denied`), `rule` (the applied rule's name, or nil),
+`scheme` (that rule's scheme, or nil), `status`, `error` and `meta` (the
+session's, unchanged). Never a header, never a body. The host attaches a
+handler and writes its log line with whatever `meta` carries; the library
+logs only refusals, which have no session to attribute.
+
+**`outcome` answers "did a rule apply", not "was a credential
+attached"**, and the two are not the same question. `:passthrough` means
+**no rule matched** and the session's policy let the request through, so
+it never appears under `unmatched_host_policy: :deny`. A matched
+`:passthrough` rule — the documented way a host is allowed under `deny` —
+is `outcome: :injected` with that rule's name, because a rule did apply;
+nothing was attached to the request.
+
+`scheme` is what separates them, and it is the field an audit log should
+read. In a default-deny session the two rules a consumer most wants to
+tell apart are exactly the two that `outcome` collapses:
+
+| rule | `outcome` | `rule` | `scheme` |
+|---|---|---|---|
+| `api.stripe.com`, `:bearer` | `:injected` | `"stripe"` | `:bearer` |
+| `registry.npmjs.org`, `:passthrough` | `:injected` | `"npm"` | `:passthrough` |
+| no rule matched, policy `:passthrough` | `:passthrough` | nil | nil |
+| refused | `:denied` | nil | nil |
 
 **The event is terminal**: one per request, emitted when the request is
 over rather than when it starts.
