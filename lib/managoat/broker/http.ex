@@ -184,6 +184,28 @@ defmodule Managoat.Broker.HTTP do
   end
 
   @doc """
+  Serialise a response head back to bytes, the mirror of
+  `encode_request/2`.
+
+  For the one place a proxy cannot relay a response verbatim: `Connection`
+  describes the hop it arrived on, so the head has to be re-emitted with
+  this hop's own. Bodies are never rebuilt — they stream through as they
+  arrive.
+  """
+  @spec encode_response(response_head()) :: iodata()
+  def encode_response(%{status: status, reason: reason, version: {maj, min}, headers: headers}) do
+    [
+      "HTTP/#{maj}.#{min} ",
+      Integer.to_string(status),
+      " ",
+      reason,
+      "\r\n",
+      Enum.map(headers, fn {k, v} -> [k, ": ", v, "\r\n"] end),
+      "\r\n"
+    ]
+  end
+
+  @doc """
   The host and port a request-target names, and the origin-form target to
   forward. Absolute-form (`http://host/path`) is what a client sends a
   forward proxy for plain HTTP; an authority (`host:port`) is a `CONNECT`.

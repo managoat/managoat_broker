@@ -406,6 +406,42 @@ defmodule Managoat.Broker.ProxyCase do
     end
   end
 
+  @doc """
+  Read one `Content-Length`-framed response off a plain socket, leaving
+  the connection open. `{head, body}`.
+
+  The absolute-form path keeps a connection alive now, so a test that
+  wants one response reads one response; `read_until_closed/2` is for the
+  paths that still end the connection.
+  """
+  def read_plain_response(tcp, acc \\ "") do
+    case framed_response(acc) do
+      {:ok, head, body} ->
+        {head, body}
+
+      :more ->
+        {:ok, data} = :gen_tcp.recv(tcp, 0, 5_000)
+        read_plain_response(tcp, acc <> data)
+    end
+  end
+
+  defp framed_response(acc) do
+    with [head, body] <- String.split(acc, "\r\n\r\n", parts: 2),
+         [_, len] <- Regex.run(~r/content-length: (\d+)/i, head),
+         len = String.to_integer(len),
+         true <- byte_size(body) >= len do
+      {:ok, head, binary_part(body, 0, len)}
+    else
+      _ -> :more
+    end
+  end
+
+  @doc "Read one framed response and decode its JSON body: `{head, decoded}`."
+  def read_plain_json(tcp) do
+    {head, body} = read_plain_response(tcp)
+    {head, Jason.decode!(body)}
+  end
+
   @doc "Read a plain socket until the peer closes it."
   def read_until_closed(tcp, acc \\ "") do
     case :gen_tcp.recv(tcp, 0, 5_000) do

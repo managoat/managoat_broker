@@ -237,11 +237,8 @@ defmodule Managoat.Broker.IPv6Test do
             "Authorization: Bearer __placeholder__\r\n\r\n"
         )
 
-      reply = read_until_closed(tcp)
-      assert reply =~ "HTTP/1.1 200"
-
-      [_, body] = String.split(reply, "\r\n\r\n", parts: 2)
-      echoed = Jason.decode!(body)
+      {head, echoed} = read_plain_json(tcp)
+      assert head =~ "HTTP/1.1 200"
 
       assert echoed["path"] == "/v6"
       assert echoed["headers"]["authorization"] == "Bearer ghp_real"

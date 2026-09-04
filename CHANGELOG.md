@@ -10,6 +10,72 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-03
+
+Absolute-form plain HTTP keeps the sandbox's connection alive. Closes #13,
+the last of #5's deferred rows.
+
+### Changed
+
+- **A plain-HTTP connection may carry more than one request.** It ended
+  after one before: the proxy asked the origin for `Connection: close` and
+  relayed the response verbatim, so the sandbox read that instruction and
+  hung up. `apt` and its kin now get one connection instead of one per
+  request.
+
+  Each request on it is decided afresh — authenticated, host-checked,
+  matched against the session's rules and given its own read deadline —
+  so nothing is carried over from the first request and a `deny` session
+  refuses a host it does not allow whether it is asked first or tenth.
+  Resolving the session per request is what Agent Vault's `handleForward`
+  did too ("the scope is resolved per request rather than once per
+  tunnel").
+
+  A connection still ends after one request when the client asked for that
+  with `Connection: close`, when it speaks HTTP/1.0, when the response ends
+  only at the origin's close — there is no boundary for anything to follow
+  — or on any refusal.
+
+- **The response head is re-emitted rather than relayed byte for byte, on
+  that path only.** `Connection` describes the hop it arrived on, and the
+  proxy is the one that asked the origin to close, so the head is read in
+  full, stripped of `Connection`, `Keep-Alive` and `Proxy-Connection`, and
+  written back with this hop's own answer. `Transfer-Encoding` deliberately
+  stays: the body is relayed verbatim, chunk framing included.
+
+  This narrows the property `Managoat.Broker.Response` was built around —
+  it is still an observer, but on this path it observes a head the sandbox
+  has already been sent a rewritten copy of, rather than the exact bytes.
+  **Bodies are untouched**, which is the half that keeps a streamed reply
+  a stream, and inside a `CONNECT` tunnel nothing is held back at all. The
+  head is bounded at the same 64 KiB `Response` bounds an incomplete head
+  by. Agent Vault rebuilt every response head on this path
+  (`internal/mitm/forward.go`), so it never had the property to narrow.
+
+- **`[:managoat, :broker, :connect]` counts origin connections, not
+  sandbox ones.** A tunnel is one of each, as before; an absolute-form
+  connection carrying three requests now dials three times and emits three
+  events, where it used to emit one and serve one request. A consumer
+  computing a failure ratio over this event still has a correct
+  denominator — it is the number of times the proxy tried to reach an
+  origin — but the number itself changes on this path.
+
+### Added
+
+- `Managoat.Broker.HTTP.encode_response/1`, the mirror of
+  `encode_request/2`, for the head the plain path has to re-emit.
+
+### Decided, and unchanged
+
+- **The origin connection is still one per request**, dialed fresh and
+  asked to close, where Agent Vault pooled them through Go's
+  `http.Transport` (per host, 90-second idle timeout). A pool saves a local
+  handshake and costs the race that comes with one — a socket the origin
+  closed while it was idle — and the usual answer, redial and retry, is
+  unavailable here: the proxy streams a request body upstream rather than
+  buffering it, so there is nothing left to send again. Recorded in
+  README.md's deviations.
+
 ## [0.9.0] - 2026-09-03
 
 The leaf cache is bounded, and a host is validated before it can become a
