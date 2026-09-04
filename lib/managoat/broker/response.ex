@@ -3,12 +3,20 @@ defmodule Managoat.Broker.Response do
   Which request a response belongs to, what status it carried, and when it
   ended — worked out from the bytes coming back from an origin.
 
-  This is an *observer*, not a relay. The proxy sends every upstream byte
-  to the sandbox the instant it arrives and then hands the same bytes here,
-  so framing can never delay, reorder or accumulate a body: a streaming
-  reply streams whatever this module concludes, and a framing failure costs
-  telemetry rather than the response. The only bytes it ever holds are
-  those of a head that has not arrived in full yet, and that is capped.
+  This is an *observer*, not a relay. The proxy sends every upstream **body**
+  byte to the sandbox the instant it arrives and then hands the same bytes
+  here, so framing can never delay, reorder or accumulate a body: a
+  streaming reply streams whatever this module concludes, and a framing
+  failure costs telemetry rather than the response. The only bytes it ever
+  holds are those of a head that has not arrived in full yet, and that is
+  capped.
+
+  Heads are the exception, and only on the absolute-form path, where the
+  proxy keeps the sandbox's connection alive: `Connection` describes the
+  hop it arrived on, so `Managoat.Broker.Proxy` reads that head in full,
+  re-emits it with this hop's own answer and hands the *original* bytes
+  here afterwards. What this module frames is therefore always what the
+  origin actually said. Inside a tunnel nothing is held back at all.
 
   ## Correlation
 

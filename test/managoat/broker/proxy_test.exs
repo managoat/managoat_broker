@@ -282,10 +282,8 @@ defmodule Managoat.Broker.ProxyTest do
           "Authorization: Bearer __github_token__\r\n\r\n"
       )
 
-    reply = read_until_closed(tcp)
-    assert reply =~ "HTTP/1.1 200"
-    [_, body] = String.split(reply, "\r\n\r\n", parts: 2)
-    echoed = Jason.decode!(body)
+    {head, echoed} = read_plain_json(tcp)
+    assert head =~ "HTTP/1.1 200"
     assert echoed["path"] == "/plain"
     assert echoed["headers"]["authorization"] == "Bearer ghp_real"
     refute Map.has_key?(echoed["headers"], "proxy-authorization")
@@ -304,9 +302,8 @@ defmodule Managoat.Broker.ProxyTest do
     Process.sleep(50)
     :ok = :gen_tcp.send(tcp, "lo")
 
-    reply = read_until_closed(tcp)
-    [_, body] = String.split(reply, "\r\n\r\n", parts: 2)
-    assert Jason.decode!(body)["body"] == "hello"
+    {_head, echoed} = read_plain_json(tcp)
+    assert echoed["body"] == "hello"
   end
 
   test "plain HTTP under deny to an unmatched host is 403", ctx do
@@ -416,8 +413,7 @@ defmodule Managoat.Broker.ProxyTest do
           "Host: localhost\r\nProxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
       )
 
-    [_, body] = String.split(read_until_closed(tcp), "\r\n\r\n", parts: 2)
-    echoed = Jason.decode!(body)
+    {_head, echoed} = read_plain_json(tcp)
 
     assert echoed["path"] == "/absolute"
     assert echoed["query"] == "token=#{secret}"
@@ -481,8 +477,7 @@ defmodule Managoat.Broker.ProxyTest do
             "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
         )
 
-      [_, body] = String.split(read_until_closed(tcp), "\r\n\r\n", parts: 2)
-      echoed = Jason.decode!(body)
+      {_head, echoed} = read_plain_json(tcp)
 
       assert echoed["path"] == "/bot123456:AAE-real/send"
       assert echoed["query"] == "key=123456:AAE-real"
@@ -750,7 +745,7 @@ defmodule Managoat.Broker.ProxyTest do
             "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
         )
 
-      read_until_closed(tcp)
+      read_plain_response(tcp)
 
       assert_receive {:request, %{count: 1, duration: _},
                       %{path: "/plain-ok", status: 200, error: nil}}

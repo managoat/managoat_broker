@@ -10,6 +10,22 @@ defmodule Managoat.Broker.Proxy do
   `Proxy-Authorization: Basic base64(token:label)`; the token is looked up
   in the `Managoat.Broker.Store` once per connection.
 
+  Absolute-form requests keep the sandbox's connection alive: it may carry
+  another, and each one is authenticated, validated, matched against the
+  session's rules and given its own read deadline again, so the second
+  request on a connection is decided exactly as the first was. The two
+  hops' lifetimes are decided separately, which is what a proxy is
+  supposed to do with a hop-by-hop header: the *origin* connection is this
+  request's alone — dialed fresh, asked to close, closed after the
+  response — so there is no pooled socket to be caught being closed
+  underneath a request whose body has already been streamed away and
+  cannot be sent again. The response head is re-emitted with this hop's
+  own `Connection` rather than the origin's, which is the one place a
+  response is not relayed byte for byte; its body still is. A connection
+  ends after one request when the client asked it to, when it speaks
+  HTTP/1.0, when the response ends only at the origin's close, or on any
+  refusal.
+
   On `CONNECT` the proxy opens the upstream TLS connection first (a host it
   cannot reach is a `502` before the tunnel exists), answers `200`, then
   completes a TLS handshake with the *sandbox* using a leaf for that host
@@ -61,6 +77,11 @@ defmodule Managoat.Broker.Proxy do
   `:unauthenticated` there is no session and no destination yet, so `host`
   and `port` are nil and `meta` is empty.
 
+  It counts *origin* connections, not sandbox ones. A `CONNECT` tunnel is
+  one of each, but an absolute-form connection carrying three requests
+  dials three times and emits three, since each request is its own
+  decision about its own origin.
+
   ## Timeouts
 
   Three bound a connection, and one bounds a request. `@head_timeout` (30s)
@@ -96,6 +117,15 @@ defmodule Managoat.Broker.Proxy do
   @head_timeout 30_000
   @idle_timeout 300_000
   @connect_timeout 10_000
+
+  # A response head this long has not arrived and is not going to be one.
+  # The same bound `Managoat.Broker.Response` puts on the same bytes.
+  @max_response_head 64 * 1024
+
+  # Response headers that describe the hop they arrived on rather than the
+  # response, so the proxy answers for its own hop instead of relaying
+  # theirs.
+  @hop_by_hop_response ~w(connection keep-alive proxy-connection)
 
   # The default wall-clock bound on reading *one* request, head and body,
   # overridable per listener with `request_read_timeout`. The two timeouts
@@ -159,7 +189,15 @@ defmodule Managoat.Broker.Proxy do
           end
 
         _ ->
-          forward_plain(socket, head, rest, {host, port, target}, session, state, deadline)
+          case forward_plain(socket, head, rest, {host, port, target}, session, state, deadline) do
+            # Another absolute-form request on the same connection: read it
+            # like the first. Which means it is authenticated, validated,
+            # matched against the session's rules and given its own read
+            # deadline again — none of that is carried over, and the second
+            # request on a connection is decided exactly as the first was.
+            {:keep_alive, rest} -> serve_client(socket, rest, state, attempts)
+            {:close, _} = done -> done
+          end
       end
     else
       {:retry, rest} -> serve_client(socket, rest, state, attempts - 1)
@@ -837,41 +875,22 @@ defmodule Managoat.Broker.Proxy do
          {:ok, upstream} <- connect_plain(socket, addresses, host, port) do
       connect_event(session, host, port, :ok)
 
-      headers = [
-        {"connection", "close"}
-        | Enum.reject(headers, &(String.downcase(elem(&1, 0)) == "connection"))
-      ]
+      plain = %{
+        client: socket,
+        upstream: upstream,
+        max_request_bytes: state.max_request_bytes,
+        max_response_bytes: state.max_response_bytes,
+        pending: pending_request(session, head, host, {:ok, rule})
+      }
 
-      # One request, so the framer here is a queue of one and the handler
-      # itself relays and frames; no second process to correlate with.
-      framer =
-        Response.expect(
-          Response.new(state.max_response_bytes),
-          pending_request(session, head, host, {:ok, rule})
-        )
+      outcome = exchange_plain(plain, head, headers, target, rest, deadline)
 
-      encoded = HTTP.encode_request(%{head | headers: headers}, target)
-
-      with :ok <- :gen_tcp.send(upstream, encoded),
-           :ok <-
-             copy_body_plain(
-               socket,
-               upstream,
-               framing,
-               {state.max_request_bytes, deadline},
-               rest
-             ) do
-        pump_plain(upstream, socket, framer, state.max_response_bytes)
-      else
-        {:error, reason} when reason in [:request_too_large, :request_timeout] ->
-          finish_relay(framer, &Response.failed(&1, reason))
-
-        {:error, _} ->
-          finish_relay(framer, &Response.failed(&1, :upstream_send_failed))
-      end
-
+      # The upstream connection belongs to this request and closes with it,
+      # whatever the sandbox's connection goes on to do. See the moduledoc:
+      # the two hops' lifetimes are decided separately, and only the
+      # sandbox's is being kept.
       :gen_tcp.close(upstream)
-      {:close, state}
+      outcome_of(outcome, state)
     else
       true ->
         {:close, state}
@@ -883,6 +902,47 @@ defmodule Managoat.Broker.Proxy do
       {:error, _} ->
         connect_event(session, host, port, :upstream_failed)
         {:close, state}
+    end
+  end
+
+  defp outcome_of({:keep_alive, rest}, _state), do: {:keep_alive, rest}
+  defp outcome_of(:close, state), do: {:close, state}
+
+  # One absolute-form request and its response. `{:keep_alive, rest}` when
+  # the sandbox's connection may carry another (`rest` is whatever it has
+  # already sent of the next one), `:close` otherwise.
+  defp exchange_plain(plain, head, headers, target, rest, deadline) do
+    framer = Response.expect(Response.new(plain.max_response_bytes), plain.pending)
+
+    # The origin is asked to close whatever the sandbox asked of us: this
+    # request dials its own connection, so there is no pooled socket to
+    # reuse and none to be caught being closed underneath a request whose
+    # body has already been streamed away and cannot be sent again.
+    upstream_headers = [
+      {"connection", "close"}
+      | Enum.reject(headers, &(String.downcase(elem(&1, 0)) == "connection"))
+    ]
+
+    encoded = HTTP.encode_request(%{head | headers: upstream_headers}, target)
+
+    with :ok <- :gen_tcp.send(plain.upstream, encoded),
+         {:ok, rest} <-
+           copy_body_plain(
+             plain.client,
+             plain.upstream,
+             HTTP.body_framing(head),
+             {plain.max_request_bytes, deadline},
+             rest
+           ) do
+      pump_plain(plain, framer, head, rest)
+    else
+      {:error, reason} when reason in [:request_too_large, :request_timeout] ->
+        finish_relay(framer, &Response.failed(&1, reason))
+        :close
+
+      {:error, _} ->
+        finish_relay(framer, &Response.failed(&1, :upstream_send_failed))
+        :close
     end
   end
 
@@ -943,10 +1003,10 @@ defmodule Managoat.Broker.Proxy do
   # proxy will forward, the deadline how long it will spend reading one.
   defp copy_body_plain(client, upstream, framing, {limit, deadline} = bounds, buffer, count) do
     case HTTP.take_body(framing, buffer) do
-      {:done, bytes, _rest} ->
+      {:done, bytes, rest} ->
         if within?(count + byte_size(bytes), limit) do
-          if bytes != "", do: :gen_tcp.send(upstream, bytes)
-          :ok
+          plain_send(upstream, bytes)
+          {:ok, rest}
         else
           {:error, :request_too_large}
         end
@@ -968,36 +1028,152 @@ defmodule Managoat.Broker.Proxy do
   defp plain_send(_upstream, ""), do: :ok
   defp plain_send(upstream, bytes), do: :gen_tcp.send(upstream, bytes)
 
-  # As in a tunnel: every byte reaches the sandbox first, and the same
-  # bytes are then shown to the framer, which only works out when the
-  # response ended. The loop still runs to the origin's close — the proxy
-  # sent `Connection: close`, so that is the end of the exchange — but the
-  # event fires when the body completes, not when the socket does.
-  defp pump_plain(upstream, client, framer, limit) do
-    case :gen_tcp.recv(upstream, 0, @idle_timeout) do
-      {:ok, data} ->
-        case Socket.send(client, data) do
-          :ok ->
-            {framer, finished} = Response.observe(framer, data)
-            Enum.each(finished, &emit_finished/1)
+  # The response, back to the sandbox. The head is the one thing this path
+  # cannot relay verbatim — `Connection` describes the hop it arrived on,
+  # and the proxy is the one that asked the origin to close — so it is read
+  # in full, re-emitted with this hop's own answer, and only then shown to
+  # the framer. The body is untouched: every byte reaches the sandbox the
+  # instant it arrives and the framer sees the same bytes afterwards,
+  # exactly as before.
+  defp pump_plain(plain, framer, request) do
+    case read_response_head(plain.upstream, "") do
+      {:ok, response, head_bytes, tail} ->
+        keep? = keep_alive?(request, response)
 
-            # A response past its cap has already emitted; nothing is left
-            # to relay it to.
-            if Response.halted?(framer),
-              do: :ok,
-              else: pump_plain(upstream, client, framer, limit)
-
+        with :ok <- Socket.send(plain.client, rehead(response, keep?)),
+             :ok <- client_send(plain.client, tail) do
+          relay_plain(plain, observe(framer, head_bytes <> tail), keep?)
+        else
           {:error, _} ->
             finish_relay(framer, &Response.failed(&1, :client_closed))
+            :close
         end
 
-      {:error, :closed} ->
-        finish_relay(framer, &Response.closed/1)
-
-      {:error, _} ->
-        finish_relay(framer, &Response.failed(&1, :upstream_read_failed))
+      {:error, reason} ->
+        finish_relay(framer, &Response.failed(&1, reason))
+        :close
     end
   end
+
+  defp pump_plain(plain, framer, request, client_rest) do
+    case pump_plain(plain, framer, request) do
+      {:keep_alive, _} -> {:keep_alive, client_rest}
+      :close -> :close
+    end
+  end
+
+  # The rest of the body, verbatim, until the framer says the response
+  # ended. A response that ends only at the origin's close keeps this loop
+  # running to the close, which is what says it ended.
+  defp relay_plain(plain, framer, keep?) do
+    cond do
+      # A response past its cap has already emitted; nothing is left to
+      # relay it to, and nothing this connection could honestly carry next.
+      Response.halted?(framer) ->
+        :close
+
+      Response.idle?(framer) ->
+        if keep?, do: {:keep_alive, nil}, else: :close
+
+      true ->
+        case :gen_tcp.recv(plain.upstream, 0, @idle_timeout) do
+          {:ok, data} ->
+            case Socket.send(plain.client, data) do
+              :ok ->
+                relay_plain(plain, observe(framer, data), keep?)
+
+              {:error, _} ->
+                finish_relay(framer, &Response.failed(&1, :client_closed))
+                :close
+            end
+
+          {:error, :closed} ->
+            finish_relay(framer, &Response.closed/1)
+            :close
+
+          {:error, _} ->
+            finish_relay(framer, &Response.failed(&1, :upstream_read_failed))
+            :close
+        end
+    end
+  end
+
+  defp observe(framer, data) do
+    {framer, finished} = Response.observe(framer, data)
+    Enum.each(finished, &emit_finished/1)
+    framer
+  end
+
+  # A response head, in full, before any of it reaches the sandbox. Bounded
+  # for the reason `Managoat.Broker.Response` bounds an incomplete head by
+  # the same 64 KiB: the bytes of a head that has not arrived are the only
+  # thing either of them holds on to, and a head this long is not going to
+  # be one.
+  defp read_response_head(upstream, buffer) do
+    case HTTP.parse_response(buffer) do
+      {:ok, response, rest} ->
+        {:ok, response, binary_part(buffer, 0, byte_size(buffer) - byte_size(rest)), rest}
+
+      {:more, _} when byte_size(buffer) > @max_response_head ->
+        {:error, :malformed_response}
+
+      {:more, _} ->
+        case :gen_tcp.recv(upstream, 0, @idle_timeout) do
+          {:ok, data} -> read_response_head(upstream, buffer <> data)
+          {:error, :closed} -> {:error, :upstream_closed}
+          {:error, _} -> {:error, :upstream_read_failed}
+        end
+
+      {:error, _reason} ->
+        {:error, :malformed_response}
+    end
+  end
+
+  # May the sandbox's connection carry another request? Everything has to
+  # agree. The client asked for one, by speaking HTTP/1.1 and not saying
+  # `close` — an HTTP/1.0 client is answered and closed, since keep-alive
+  # was the exception there and negotiating it is not worth the ambiguity.
+  # The response says exactly where it ends, because a body that runs to
+  # the close cannot be followed by anything. And it is not an upgrade,
+  # after which the bytes are no longer HTTP at all.
+  defp keep_alive?(request, response) do
+    request.version == {1, 1} and
+      not close_requested?(request.headers) and
+      response.status != 101 and
+      HTTP.response_framing(response.status, response.headers, request.method) != :until_close
+  end
+
+  defp close_requested?(headers) do
+    case HTTP.header(headers, "connection") do
+      nil ->
+        false
+
+      value ->
+        value
+        |> String.downcase()
+        |> String.split(",")
+        |> Enum.map(&String.trim/1)
+        |> Enum.member?("close")
+    end
+  end
+
+  # The response head as this hop must present it. `Connection` and
+  # `Keep-Alive` describe the hop they arrived on — the proxy asked the
+  # origin to close, which is not the sandbox's business — so they are
+  # replaced by what this hop is doing. `Transfer-Encoding` is hop-by-hop
+  # too and deliberately stays: the body is relayed verbatim, chunk framing
+  # included, so the header describing it has to survive with it.
+  defp rehead(response, keep_alive?) do
+    headers =
+      response.headers
+      |> Enum.reject(&(String.downcase(elem(&1, 0)) in @hop_by_hop_response))
+      |> Kernel.++([{"connection", if(keep_alive?, do: "keep-alive", else: "close")}])
+
+    HTTP.encode_response(%{response | headers: headers})
+  end
+
+  defp client_send(_client, ""), do: :ok
+  defp client_send(client, bytes), do: Socket.send(client, bytes)
 
   # ---------------------------------------------------------------------------
 

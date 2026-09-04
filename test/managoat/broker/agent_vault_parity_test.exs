@@ -291,6 +291,29 @@ defmodule Managoat.Broker.AgentVaultParityTest do
     end)
   end
 
+  # TestMITMForwardKeepAlive-shaped: handleForward (internal/mitm/forward.go)
+  # answers over the existing connection with Go's http.Server, which keeps
+  # it alive, and resolves the scope per request rather than once per
+  # tunnel. Both are matched here; plain_keep_alive_test.exs is the rest of
+  # the acceptance list.
+  test "an absolute-form connection carries a second request, decided afresh", ctx do
+    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+    for path <- ["/first", "/second"] do
+      :ok =
+        :gen_tcp.send(
+          tcp,
+          "GET http://localhost:#{ctx.http_port}#{path} HTTP/1.1\r\nHost: localhost\r\n" <>
+            "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n" <>
+            "Authorization: Bearer __placeholder__\r\n\r\n"
+        )
+
+      {_head, echoed} = read_plain_json(tcp)
+      assert echoed["path"] == path
+      assert echoed["headers"]["authorization"] == "Bearer real-secret"
+    end
+  end
+
   # Not ported, and each one a decision rather than a backlog item. Agent
   # Vault is deleted from the cluster and from Fountain's codebase, so the
   # A/B that settled the last round — the same request against both
@@ -325,12 +348,14 @@ defmodule Managoat.Broker.AgentVaultParityTest do
   #
   # Divergent for now, with a condition attached:
   #
-  # - Plain-HTTP client keep-alive. `forward_plain/8` sends `Connection:
-  #   close` upstream and closes after the response. Supporting keep-alive
-  #   is not just dropping that header: successive absolute-form requests
-  #   on one connection may name different origins, so auth and session
-  #   reuse must stay well-defined. No consumer needs it; if one does it
-  #   gets its own issue and acceptance tests.
+  # - Upstream connection pooling. Agent Vault ran outbound requests through
+  #   Go's `http.Transport`, which pools per host with a 90s idle timeout.
+  #   Here the sandbox's connection is kept alive (see
+  #   plain_keep_alive_test.exs) but each request dials its own origin
+  #   connection: a pooled socket can be closed by the origin while idle,
+  #   and the usual answer — redial and retry — is unavailable, since the
+  #   request body was streamed upstream rather than buffered and cannot be
+  #   sent again.
   # - TestMITMSubstitutionBody (placeholder rewriting inside a request
   #   body): the `:substitute` rule reaches header values and the request
   #   target, so a credential in a header, a path or a query is brokered,

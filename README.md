@@ -154,6 +154,30 @@ Rules match against the target the client sent, and telemetry is derived
 from that same original, so a placeholder in a path is logged as the
 placeholder and one in a query is not logged at all.
 
+### Connections, and who decides them
+
+Absolute-form plain HTTP keeps the sandbox's connection alive, so `apt` and
+its kin get one connection rather than one per request. Each request on it
+is authenticated, host-checked, matched against the session's rules and
+given its own read deadline again — nothing is carried over, so the second
+request on a connection is decided exactly as the first was, and a `deny`
+session refuses a host it does not allow whether it is asked first or
+tenth.
+
+The two hops are decided separately, which is what a proxy is supposed to
+do with a hop-by-hop header. The origin is asked to close and its
+connection is dropped after the response; the sandbox is told what *this*
+hop is doing, which means the response head is re-emitted with the proxy's
+own `Connection` rather than the origin's. That head is the one place a
+response is not relayed byte for byte — bodies still are, which is what
+keeps a streamed reply a stream. A connection ends after one request when
+the client asked for that, when it speaks HTTP/1.0, when the response ends
+only at the origin's close (there is no boundary to follow), or on any
+refusal.
+
+`CONNECT` tunnels are unaffected: they always kept alive, and everything
+inside one is already per request.
+
 ## The child spec
 
 `{Managoat.Broker, port: 14322, store: Module, ca_seed: <32 bytes>,
@@ -309,17 +333,20 @@ or from the protocol; it cannot be measured.
 
 ### Deliberate for now, with a condition attached
 
-- **Absolute-form (plain HTTP) is one request per connection.** The proxy
-  adds `Connection: close` upstream and closes after the response; HTTPS
-  tunnels keep-alive normally.
+- **One origin connection per absolute-form request, where Agent Vault
+  pooled them.** The sandbox's connection is kept alive and may carry as
+  many requests as it likes; the *origin* connection is dialed fresh for
+  each one, asked to close, and closed after the response. Agent Vault ran
+  its outbound requests through Go's `http.Transport`, which keeps a pool
+  keyed by host with a 90-second idle timeout.
 
-  Supporting client keep-alive is not just dropping that header:
-  successive absolute-form requests on one proxy connection may name
-  different origins, so auth and session reuse have to stay well-defined,
-  and finding the response boundary safely needs the response framing that
-  now exists. The traffic is apt and little else, and no consumer needs
-  it. If one does, it gets its own issue and its own acceptance tests
-  rather than riding along with something else.
+  A pool would save a handshake per request and cost the race that comes
+  with one: a pooled socket the origin closed while it was idle. The usual
+  answer is to redial and retry, and that answer is not available here —
+  the proxy streams a request body upstream rather than buffering it, so
+  there is nothing left to send again. Dialing per request is always
+  correct, and it is a local TCP handshake against traffic that is
+  package managers.
 
 - **Body caps are configurable, with Agent Vault's defaults.**
   `max_request_bytes` defaults to 1 GiB, matching Agent Vault's

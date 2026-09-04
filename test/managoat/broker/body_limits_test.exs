@@ -125,6 +125,31 @@ defmodule Managoat.Broker.BodyLimitsTest do
                      2_000
     end
 
+    test "an over-long response ends an absolute-form connection too" do
+      # The plain path keeps its connection alive, so the cap has to be
+      # what ends it — the sandbox cannot be left waiting for the rest of a
+      # response the proxy stopped relaying.
+      ctx = start_rig(max_response_bytes: 8)
+      session = bearer_session("ghp_real")
+      ctx = Map.merge(ctx, %{token: put_session(ctx, session), session: session})
+      Memory.put(ctx.store, ctx.token, attach_request_telemetry(ctx))
+
+      {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+
+      :ok =
+        :gen_tcp.send(
+          tcp,
+          "GET http://localhost:#{ctx.http_port}/plain-long HTTP/1.1\r\nHost: localhost\r\n" <>
+            "Proxy-Authorization: #{proxy_auth(ctx.token)}\r\n\r\n"
+        )
+
+      assert read_until_closed(tcp) =~ "HTTP/1.1 200"
+
+      assert_receive {:request, %{duration: _},
+                      %{path: "/plain-long", status: 200, error: :response_too_large}},
+                     2_000
+    end
+
     test "no cap is the default: a response of any size relays whole" do
       ctx = start_rig()
       token = put_session(ctx, bearer_session("ghp_real"))
