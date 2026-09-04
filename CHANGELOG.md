@@ -10,6 +10,43 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-03
+
+Documentation: what the relay-verbatim property is actually worth, and two
+things 0.10.0 changed without saying so.
+
+### Documented
+
+- **`Managoat.Broker.Response`'s moduledoc now carries the exchange rate
+  rather than the shorthand.** "Byte-perfect relay is what keeps a stream a
+  stream" is not the mechanism — streaming is the body pump's doing, and
+  0.10.0 rewrites a head on the absolute-form path and streams exactly as
+  before. What relaying a head verbatim actually buys is that a parse
+  failure cannot reach the wire (this module already runs the parser on
+  every response; the property is that its verdict is telemetry) and that
+  header names survive as the origin wrote them. What it costs is every
+  feature that would edit a response, inside a tunnel.
+
+  It is a budget rather than a law, it has been spent once, and the next
+  request to spend it is #29. The moduledoc says what the blast radius is
+  in a tunnel and why it is still whole there.
+
+### Fixed
+
+- **Two notes 0.10.0 owed.** Rewriting the response head on the
+  absolute-form path means header *names* are re-emitted as OTP's parser
+  canonicalises them — `CONTENT-TYPE` goes out as `Content-Type`,
+  `x-api-key` as `X-Api-Key`. Order and duplicates are unchanged, and
+  header names are case-insensitive, so nothing should notice; it is still
+  a change in the bytes on the wire that 0.10.0's entry did not mention.
+
+  README.md also still said absolute-form was one request per connection,
+  and that the session token is looked up once per client connection. The
+  first stopped being true in 0.10.0; the second is now true only inside a
+  tunnel, because each absolute-form request carries its own
+  `Proxy-Authorization` and trusting the first would serve a token the
+  proxy never checked.
+
 ## [0.10.0] - 2026-09-03
 
 Absolute-form plain HTTP keeps the sandbox's connection alive. Closes #13,

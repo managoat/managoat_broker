@@ -18,6 +18,50 @@ defmodule Managoat.Broker.Response do
   here afterwards. What this module frames is therefore always what the
   origin actually said. Inside a tunnel nothing is held back at all.
 
+  ## What relaying a head verbatim is worth
+
+  Written down because the shorthand — "byte-perfect relay is what keeps a
+  stream a stream" — is not the mechanism, and the next request to rewrite
+  a response head deserves an exchange rate rather than a slogan.
+
+  Streaming is the *body* pump's doing. The proxy writes every body byte to
+  the sandbox before this module sees it, and rewriting a head does not
+  touch that: the absolute-form path rewrites one and streams exactly as it
+  did before. So "a head cannot be rewritten or streaming would suffer" is
+  not an argument, and was never the one that mattered.
+
+  Two things are:
+
+    * **A parse failure cannot reach the wire.** This module already runs
+      the parser on every response — it has to, to know when one ended. The
+      property is not that the risky code is absent, it is that the risky
+      code's verdict is *telemetry*. A head OTP's parser chokes on costs a
+      log line here. Re-emit heads and the same head costs the response.
+    * **Header names survive as the origin wrote them.** OTP's parser
+      canonicalises them: `CONTENT-TYPE` comes back `Content-Type` and
+      `x-api-key` comes back `X-Api-Key`. Order and duplicates survive;
+      casing does not. Re-emitting a head therefore rewrites casing on
+      every response, for every agent, for good. Legal — header names are
+      case-insensitive — and occasionally not harmless.
+
+  What the property costs is every feature that would edit a response:
+  dropping a `Set-Cookie` an origin is planting on the agent, adding a
+  header of the proxy's own, normalising anything at all. Inside a tunnel
+  none of those are available without giving it up.
+
+  So it is a budget rather than a law, and it has been spent once already —
+  on the path where the traffic is package managers and the responses are
+  short. Spend it again where something needs it and the blast radius is
+  understood. In a tunnel that radius is every streamed reply and every
+  clone this proxy exists to carry, which is why it is still whole there.
+
+  Agent Vault had none of this to weigh. It ran Go's `http.Server` at both
+  ends — inside the CONNECT tunnel included (`internal/mitm/connect.go`) —
+  so every response was parsed into an `http.Response` and rebuilt from a
+  header map, and its `flushingWriter` exists to claw back the streaming
+  that rebuilding takes away by default. Matching it here is a choice to be
+  argued, not a default to fall back to.
+
   ## Correlation
 
   HTTP/1.1 responses come back in request order, so a FIFO of request

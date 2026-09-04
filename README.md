@@ -41,8 +41,11 @@ ingress's job) speaking the two things a forward proxy speaks:
   each request's event can say what status it got and how long it took. Keep-alive works; every request on the tunnel is rewritten. A
   WebSocket upgrade is injected like any other request, after which the
   tunnel is a byte pipe.
-- **Absolute-form requests** (`GET http://host/path`) for plain HTTP, one
-  request per connection.
+- **Absolute-form requests** (`GET http://host/path`) for plain HTTP. The
+  sandbox's connection is kept alive and may carry as many requests as it
+  likes, each decided afresh; the origin's connection is this request's
+  alone. The response head is the one thing not relayed byte for byte,
+  because `Connection` describes the hop it arrived on.
 
 Either form may name an IPv6 literal, bracketed: `CONNECT [::1]:8443` and
 `GET http://[::1]:8080/x`. Names are resolved over A *and* AAAA, and the
@@ -54,9 +57,13 @@ address expects.
 
 The client authenticates with `Proxy-Authorization: Basic
 base64(token:label)`, which is what an HTTP client sends for a proxy URL
-with userinfo. The token is looked up once per client connection (the unit
-a sandbox's HTTP client pools on); `proxy-authorization` never reaches the
-origin. A missing, unknown or expired token is `407`.
+with userinfo. Inside a tunnel the token is looked up once per client
+connection (the unit a sandbox's HTTP client pools on, and the unit a
+tunnel's fixed destination makes sensible); on the absolute-form path it is
+looked up per request, since each request carries its own and trusting the
+first would serve a token the proxy never checked.
+`proxy-authorization` never reaches the origin. A missing, unknown or
+expired token is `407`.
 
 Two guards protect the operator's network and the tenant's intent:
 
