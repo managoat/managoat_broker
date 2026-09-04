@@ -96,13 +96,19 @@ defmodule Managoat.Broker.Injector do
 
   @doc """
   Rewrite `headers` and the request `target` for a request to
-  `host`:`port`. Returns `{:ok, headers, target, rule_name}` with the
-  target to forward and the name of the rule that applied — the one that
-  set the header, or the first matched rule when none did, and `nil` for
-  passthrough — `{:error, :denied}`, `{:error, {:unsafe_credential,
-  rule_name, surface}}` when a credential could not be written into the
-  target, or `{:error, {:credential_missing, rule_name, scheme}}` when a
-  matched rule that sets a header holds no usable credential.
+  `host`:`port`. Returns `{:ok, headers, target, rule}` with the target to
+  forward and the **rule** that applied — the one that set the header, or
+  the first matched rule when none did, and `nil` when no rule matched —
+  `{:error, :denied}`, `{:error, {:unsafe_credential, rule_name,
+  surface}}` when a credential could not be written into the target, or
+  `{:error, {:credential_missing, rule_name, scheme}}` when a matched rule
+  that sets a header holds no usable credential.
+
+  The rule comes back whole rather than by name because its `scheme` is
+  what says whether anything was attached: a matched `:passthrough` rule
+  and a matched `:bearer` rule are both "a rule applied", and only the
+  scheme separates them. Names are not unique, so a caller handed one
+  could not look the rest up.
 
   `target` is the request target as the client sent it, origin-form
   (`/path?query`). Rules match against it unchanged; the returned target
@@ -110,7 +116,7 @@ defmodule Managoat.Broker.Injector do
   applied.
   """
   @spec inject([header()], String.t(), :inet.port_number(), String.t(), Session.t()) ::
-          {:ok, [header()], String.t(), String.t() | nil}
+          {:ok, [header()], String.t(), Rule.t() | nil}
           | {:error, :denied}
           | {:error, {:unsafe_credential, String.t() | nil, :target | :header}}
           | {:error, {:unusable_placeholder, String.t() | nil}}
@@ -134,11 +140,11 @@ defmodule Managoat.Broker.Injector do
 
             case header_rule(matched) do
               nil ->
-                {:ok, headers, target, first.name}
+                {:ok, headers, target, first}
 
               rule ->
                 case put_auth(headers, rule) do
-                  {:ok, headers} -> {:ok, headers, target, rule.name}
+                  {:ok, headers} -> {:ok, headers, target, rule}
                   :error -> {:error, {:credential_missing, rule.name, rule.scheme}}
                 end
             end

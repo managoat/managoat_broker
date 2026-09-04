@@ -69,7 +69,7 @@ defmodule Managoat.Broker.InjectorTest do
   # call `Injector.inject/5` directly.
   defp inject(headers, host, path \\ "/", session \\ @session) do
     case Injector.inject(headers, host, 443, path, session) do
-      {:ok, headers, _target, rule} -> {:ok, headers, rule}
+      {:ok, headers, _target, rule} -> {:ok, headers, rule && rule.name}
       other -> other
     end
   end
@@ -333,6 +333,36 @@ defmodule Managoat.Broker.InjectorTest do
     {:ok, _, nil} = inject(@headers, "gist.github.com")
   end
 
+  describe "the rule that comes back" do
+    # It comes back whole because its `scheme` is what says whether
+    # anything was attached: a matched `:passthrough` rule and a matched
+    # `:bearer` rule are both "a rule applied". Names are not unique, so a
+    # caller handed one could not look the rest up.
+    test "carries the scheme, so a passthrough rule is distinguishable from a credential" do
+      session = %Session{
+        rules: [
+          %Rule{name: "paid", pattern: "api.stripe.com", scheme: :bearer, credential: "sk"},
+          %Rule{name: "allowed", pattern: "registry.npmjs.org", scheme: :passthrough}
+        ],
+        unmatched_host_policy: :deny
+      }
+
+      assert {:ok, _, _, %Rule{name: "paid", scheme: :bearer}} =
+               Injector.inject(@headers, "api.stripe.com", 443, "/v1/charges", session)
+
+      assert {:ok, out, _, %Rule{name: "allowed", scheme: :passthrough}} =
+               Injector.inject(@headers, "registry.npmjs.org", 443, "/express", session)
+
+      # And nothing was attached to the second, which is the thing the
+      # scheme is there to let a consumer say.
+      assert {"Authorization", "Bearer __github_token__"} in out
+    end
+
+    test "is nil when no rule matched" do
+      assert {:ok, _, _, nil} = Injector.inject(@headers, "example.com", 443, "/", @session)
+    end
+  end
+
   describe "precedence among matched rules" do
     # Defaults first, overrides appended is the natural way to build a rule
     # list, and under declaration order the appended override lost: the
@@ -344,7 +374,7 @@ defmodule Managoat.Broker.InjectorTest do
       session = %Session{rules: rules, unmatched_host_policy: :passthrough}
 
       case Injector.inject([{"Accept", "*/*"}], host, port, path, session) do
-        {:ok, headers, _target, rule} -> {rule, headers}
+        {:ok, headers, _target, rule} -> {rule && rule.name, headers}
         other -> other
       end
     end
@@ -435,7 +465,7 @@ defmodule Managoat.Broker.InjectorTest do
       for policy <- [:passthrough, :deny] do
         session = %Session{rules: rules, unmatched_host_policy: policy}
 
-        assert {:ok, headers, _, "org"} =
+        assert {:ok, headers, _, %Rule{name: "org"}} =
                  Injector.inject([{"Accept", "*/*"}], "api.github.com", 443, "/", session)
 
         assert {"authorization", "Bearer GENERIC"} in headers
@@ -474,7 +504,7 @@ defmodule Managoat.Broker.InjectorTest do
       session = %Session{rules: rules, unmatched_host_policy: :passthrough}
       headers = [{"X-A", "__token_a__"}, {"X-B", "__token_b__"}]
 
-      assert {:ok, out, "/x/AAA/BBB", "key"} =
+      assert {:ok, out, "/x/AAA/BBB", %Rule{name: "key"}} =
                Injector.inject(
                  headers,
                  "api.example.com",
@@ -549,7 +579,10 @@ defmodule Managoat.Broker.InjectorTest do
     }
 
     defp target(t, session \\ @bot, host \\ "api.telegram.org") do
-      Injector.inject([{"Accept", "*/*"}], host, 443, t, session)
+      case Injector.inject([{"Accept", "*/*"}], host, 443, t, session) do
+        {:ok, headers, target, rule} -> {:ok, headers, target, rule && rule.name}
+        other -> other
+      end
     end
 
     test "a placeholder in the path is replaced in the forwarded target" do
@@ -563,7 +596,7 @@ defmodule Managoat.Broker.InjectorTest do
     end
 
     test "a placeholder in the target and in a header are both replaced" do
-      assert {:ok, headers, "/bot123456:AAE-real/x", "telegram"} =
+      assert {:ok, headers, "/bot123456:AAE-real/x", %Rule{name: "telegram"}} =
                Injector.inject(
                  [{"X-Token", "__bot_token__"}],
                  "api.telegram.org",
@@ -742,7 +775,7 @@ defmodule Managoat.Broker.InjectorTest do
           ]
       }
 
-      assert {:ok, headers, "/x", "r"} =
+      assert {:ok, headers, "/x", %Rule{name: "r"}} =
                Injector.inject([{"Authorization", "__p__"}], "h.test", 443, "/x", session)
 
       assert {"Authorization", "Signature keyId=\"x\", sig=\"y\""} in headers

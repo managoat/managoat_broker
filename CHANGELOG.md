@@ -10,6 +10,53 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-03
+
+The request event can now say whether a credential was attached. Closes #27,
+reported from building `managoat/airlock`'s egress record.
+
+### Added
+
+- **`scheme` on the `[:managoat, :broker, :request]` event**: the scheme of
+  the rule `rule` names, or nil where no rule matched or the request was
+  refused.
+
+  `outcome` answers "did a rule apply", and a matched `:passthrough` rule —
+  the documented way a host is allowed under `deny` — is a rule applying.
+  So it reported `outcome: :injected`, exactly as a `:bearer` rule did, and
+  an audit log built on the event alone read as though a passthrough host
+  had received a credential. In a default-deny session those are the two
+  rules a consumer most wants to tell apart, and they were the two that
+  collapsed. Nothing errored and the log looked fine, which is the failure
+  #19 describes in another place.
+
+  A consumer that compiles its own rules could derive the scheme from the
+  name; one whose rules come from a tenant's binding or a catalog default
+  could not, and neither could anything reading the events out of band.
+  Names are not unique either, so a name is not a key to look the rest up
+  by.
+
+### Changed
+
+- **`Managoat.Broker.Injector.inject/5` returns the matched `Rule` rather
+  than its name**: `{:ok, headers, target, %Rule{} | nil}`. The proxy needs
+  the scheme and the name together, and the rule carries both. Callers that
+  want the name take `.name`.
+
+- **The docs say what `outcome` means**, in `Managoat.Broker.Proxy`'s
+  moduledoc, in `Managoat.Broker.Rule`'s and in README.md, with the table
+  that makes the pair legible: `:passthrough` means *no rule matched* and
+  therefore cannot occur under `unmatched_host_policy: :deny`; `:injected`
+  means *a rule applied*, which a `:passthrough` rule does without
+  attaching anything. #27 notes that this alone would have saved the
+  finding.
+
+### Decided, and not done
+
+- **No new `outcome` value** for "a `:passthrough` rule matched", the
+  issue's second option. It would change the meaning of a value consumers
+  already match on, to express what `scheme` now expresses additively.
+
 ## [0.10.2] - 2026-09-03
 
 ### Documented

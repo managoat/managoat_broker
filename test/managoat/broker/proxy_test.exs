@@ -357,6 +357,58 @@ defmodule Managoat.Broker.ProxyTest do
     assert_receive {:request, _, %{path: "/no", outcome: :denied, rule: nil}}
   end
 
+  test "the event's scheme says whether a credential was attached", ctx do
+    # The pair a default-deny session most wants to tell apart: a rule that
+    # attaches a credential and a rule that allows a host and attaches
+    # nothing. Both are `outcome: :injected`, because both are "a rule
+    # applied" — the scheme is what separates them, and without it an audit
+    # log reads as though the passthrough host received a credential.
+    session = attach_request_telemetry(ctx)
+
+    Memory.put(ctx.store, ctx.token, %{
+      session
+      | rules: [
+          %Rule{name: "paid", pattern: "localhost/paid", scheme: :bearer, credential: "sk"},
+          %Rule{name: "allowed", pattern: "localhost/free", scheme: :passthrough}
+        ],
+        unmatched_host_policy: :deny
+    })
+
+    tls = tunnel(ctx, ctx.token)
+
+    {_, echoed} = request(tls, "GET /paid HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert echoed["headers"]["authorization"] == "Bearer sk"
+
+    assert_receive {:request, _,
+                    %{path: "/paid", outcome: :injected, rule: "paid", scheme: :bearer}}
+
+    {_, echoed} = request(tls, "GET /free HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    refute Map.has_key?(echoed["headers"], "authorization")
+
+    assert_receive {:request, _,
+                    %{path: "/free", outcome: :injected, rule: "allowed", scheme: :passthrough}}
+  end
+
+  test "the event's scheme is nil where no rule matched or the request was refused", ctx do
+    session = attach_request_telemetry(ctx)
+    Memory.put(ctx.store, ctx.token, %{session | rules: []})
+
+    tls = tunnel(ctx, ctx.token)
+    request(tls, "GET /nothing HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert_receive {:request, _, %{path: "/nothing", outcome: :passthrough, scheme: nil}}
+
+    Memory.put(ctx.store, ctx.token, %{
+      session
+      | rules: [%Rule{name: "n", pattern: "localhost/ok", scheme: :passthrough}],
+        unmatched_host_policy: :deny
+    })
+
+    tls = tunnel(ctx, ctx.token)
+    :ok = :ssl.send(tls, "GET /no HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    {:ok, _} = :ssl.recv(tls, 0, 5_000)
+    assert_receive {:request, _, %{path: "/no", outcome: :denied, rule: nil, scheme: nil}}
+  end
+
   test "the most specific rule injects, and the event names it", ctx do
     # Declaration order is the tiebreak, not the rule: the wider rule is
     # first here, which is how a host writes defaults with overrides
