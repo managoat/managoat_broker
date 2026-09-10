@@ -17,9 +17,9 @@ release, and the traps.
 
 [`managoat_broker`](https://hex.pm/packages/managoat_broker) on hex,
 `Managoat.Broker` in the code, Apache-2.0 throughout. It was extracted from
-[Fountain](https://github.com/BinaryBourbon/fountain) under that project's ADR
+[Fountain](https://github.com/managoat/fountain) under that project's ADR
 0037 (component libraries, extracted umbrella-first under the `Managoat`
-namespace) and graduated to this repository in BinaryBourbon/fountain#1345.
+namespace) and graduated to this repository in managoat/fountain#1345.
 [NOTICE](NOTICE) records the lineage.
 
 Fountain is now one consumer among others, pinned to a hex release like any
