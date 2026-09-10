@@ -689,7 +689,7 @@ Changed. Everything else is additive.
   request bare in order to learn the scheme. Closing made that retry land on
   a dead socket, which is what `http.proxyAuthMethod=anyauth` — git's
   default — does, and it broke every brokered `git clone` when Fountain
-  moved production onto this library (BinaryBourbon/fountain#1493). The
+  moved production onto this library (managoat/fountain#1493). The
   connection is now held open for the retry and advertises
   `Proxy-Connection: Keep-Alive`, bounded by three attempts and the existing
   head timeout, and only when the refused request has no body.
@@ -721,4 +721,4 @@ Changed. Everything else is additive.
 
 ### Added
 
-- Extracted from Fountain (BinaryBourbon/fountain#1367).
+- Extracted from Fountain (managoat/fountain#1367).

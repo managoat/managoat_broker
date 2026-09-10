@@ -16,7 +16,7 @@ contribution anywhere else, including in proprietary code of your own.
 
 One thing to know, stated plainly rather than left to be discovered: Apache-2.0
 permits relicensing, and this library was extracted from
-[Fountain](https://github.com/BinaryBourbon/fountain), which is not licensed as
+[Fountain](https://github.com/managoat/fountain), which is not licensed as
 a single unit. A contribution here can therefore be redistributed by Fountain's
 maintainer under the AGPL, under the Elastic License, or under a commercial
 license. That is the same asymmetry a CLA creates, with less ceremony. If it is
