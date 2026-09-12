@@ -10,6 +10,28 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-12
+
+### Added
+
+- Opt-in `Session.http_only` policy, pinned independently of per-request
+  rule resolution. Reject raw and effective rule-produced upgrade headers
+  and nested CONNECT before forwarding; ordinary intercepted CONNECT works.
+  Validate header names and value controls to prevent template-generated
+  newlines from manufacturing an unseen upgrade header (`:unsafe_request`).
+  Refuse ambiguous request framing and rule-induced body-boundary changes.
+- Gate bounded upstream response heads for HTTP-only sessions. Unexpected
+  101 replies and malformed/ambiguous framing close without forwarding the
+  rejected packet or entering a byte pipe. Accepted bodies still stream;
+  informational replies, HEAD, chunking and keep-alive remain supported.
+- Bounded telemetry reasons `:protocol_upgrade` for request refusal and
+  `:upstream_upgrade` for an unexpected 101. The latter has no accepted
+  response status.
+
+Ordinary sessions keep their existing upgrade and relay behavior. Hosts
+must drain legacy sessions/sockets before adopting this policy; this release
+does not implement deployment-wide draining or protected credential rules.
+
 ## [0.12.0] - 2026-09-11
 
 ### Added
