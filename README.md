@@ -90,7 +90,7 @@ Two guards protect the operator's network and the tenant's intent:
 @callback lookup(token :: binary()) :: {:ok, Managoat.Broker.Session.t()} | :error
 ```
 
-That is all the proxy needs at request time: the raw token in, a session
+For lookup-only sessions, that is all the proxy needs: the raw token in, a session
 with its rules (credentials already resolved) out. Creating, releasing and
 sweeping sessions are the host's business; they touch its tables and its
 key hierarchy, and the proxy never needs any of it. Hashing the token
@@ -161,6 +161,61 @@ Rules match against the target the client sent, and telemetry is derived
 from that same original, so a placeholder in a path is logged as the
 placeholder and one in a query is not logged at all.
 
+### Per-request authorization
+
+A host can opt a session into fresh authorization by setting its
+`authorization` field to a **non-secret, server-controlled reference**,
+for example a session ID plus credential owner, grant ID and generation.
+`nil` is the default and preserves lookup-only sessions. The reference is
+not request telemetry and must never be taken from sandbox headers.
+
+The configured store then implements an additional callback:
+
+```elixir
+@callback authorize(authorization :: term(), request :: Managoat.Broker.Store.request()) ::
+            {:ok, [Managoat.Broker.Rule.t()]} | {:error, :denied | :unavailable}
+```
+
+Instance stores implement `authorize(instance, authorization, request)`.
+The request is `%{scheme: :http | :https, host: host, port: port,
+method: method, target: target}`. Host, port and scheme describe the actual
+proxy destination, independently of the sandbox's Host header; target is
+the original request target, before substitution, including any query.
+Do not log this map wholesale.
+
+The callback runs **before injection and forwarding of every HTTP
+request**, including each request inside an existing CONNECT tunnel. It
+must check durable authority for the pinned reference, serialized with
+revocation, and resolve the current credentials from that same read.
+Returned rules replace the initial rules for this request only. The
+original reference, expiry, unmatched-host policy and telemetry metadata
+remain pinned; no returned credentials are cached for later requests.
+Initial rules still check CONNECT reachability under `:deny` and can
+contain patterns with no credential. They never provide a fallback after
+an authorization failure.
+
+Denied authority (including a locally expired opted-in session) returns
+**403** with `error: :authorization_denied`. Unavailable authority, a missing
+callback, an exception/exit/throw or a malformed result returns **503** with
+`error: :authorization_unavailable`. Both close the client connection;
+callback payloads and exception messages are neither logged nor returned.
+A missing grant or session must be denied by the host, even if its initial
+lookup succeeded on a different node before revocation.
+
+The callback runs synchronously in the connection handler. Hosts must
+bound their database/provider waits and release any locks before returning.
+Admission is that host's serialized authority check: a request admitted
+before revocation may finish, including its streamed response. The next
+request must check again, regardless of missed invalidation notifications.
+
+This is an HTTP admission primitive. **Protected credential rules and
+HTTP-only transport enforcement are not implemented yet.** Ordinary rule
+processing can still rewrite headers and targets, and an accepted protocol
+upgrade still enters a byte pipe; its subsequent operations are not HTTP
+requests to this callback. Do not adopt this primitive alone as a managed
+grant custody/revocation boundary. Those consumers also need protected
+destination compilation, upgrade rejection and legacy connection draining.
+
 ### Connections, and who decides them
 
 Absolute-form plain HTTP keeps the sandbox's connection alive, so `apt` and
@@ -182,8 +237,8 @@ the client asked for that, when it speaks HTTP/1.0, when the response ends
 only at the origin's close (there is no boundary to follow), or on any
 refusal.
 
-`CONNECT` tunnels are unaffected: they always kept alive, and everything
-inside one is already per request.
+`CONNECT` tunnels keep alive too. Rule processing, and authorization for
+opted-in sessions, run for each HTTP request inside the tunnel.
 
 ## The child spec
 

@@ -8,7 +8,11 @@ defmodule Managoat.Broker.Proxy do
   (`GET http://host/path`) for plain HTTP. The client authenticates with
   the session token in its proxy URL, which arrives as
   `Proxy-Authorization: Basic base64(token:label)`; the token is looked up
-  in the `Managoat.Broker.Store` once per connection.
+  in the `Managoat.Broker.Store` once per CONNECT tunnel and once per
+  absolute-form request. Sessions with non-nil `authorization` also invoke
+  the store before every HTTP request inside the tunnel, using fresh rules
+  for that request only; see `Managoat.Broker.Store` for the admission
+  contract and its protocol-upgrade limitation.
 
   Absolute-form requests keep the sandbox's connection alive: it may carry
   another, and each one is authenticated, validated, matched against the
@@ -424,6 +428,7 @@ defmodule Managoat.Broker.Proxy do
             host: host,
             port: port,
             session: session,
+            store: state.store,
             relay: relay,
             max_request_bytes: state.max_request_bytes,
             request_read_timeout: state.request_read_timeout
@@ -741,7 +746,15 @@ defmodule Managoat.Broker.Proxy do
   end
 
   defp serve_injected(conn, head, rest, framing, deadline) do
-    case Injector.inject(head.headers, conn.host, conn.port, head.target, conn.session) do
+    request = %{
+      scheme: :https,
+      host: conn.host,
+      port: conn.port,
+      method: head.method,
+      target: head.target
+    }
+
+    case authorize_and_inject(conn.store, conn.session, request, head.headers) do
       {:ok, headers, target, rule} ->
         # `head` is the target the client sent; `target` is the one to
         # forward. Telemetry is derived from the former, so a substituted
@@ -880,7 +893,7 @@ defmodule Managoat.Broker.Proxy do
 
     with false <- oversized_plain(socket, session, head, host, framing, state),
          {:ok, headers, target, rule} <-
-           inject_or_deny(socket, head, host, port, target, session),
+           inject_or_deny(socket, head, {host, port, target}, session, state.store),
          {:ok, addresses} <- resolve(socket, host, port, state),
          {:ok, upstream} <- connect_plain(socket, addresses, host, port) do
       connect_event(session, host, port, :ok)
@@ -971,8 +984,10 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
-  defp inject_or_deny(socket, head, host, port, target, session) do
-    case Injector.inject(head.headers, host, port, target, session) do
+  defp inject_or_deny(socket, head, {host, port, target}, session, store) do
+    request = %{scheme: :http, host: host, port: port, method: head.method, target: target}
+
+    case authorize_and_inject(store, session, request, head.headers) do
       {:ok, _, _, _} = ok ->
         ok
 
@@ -981,6 +996,14 @@ defmodule Managoat.Broker.Proxy do
         status = refusal_status(reason)
         reply(socket, status, status_reason(status))
         {:error, :denied}
+    end
+  end
+
+  # Keep the admitted rules local to this request. In particular, never
+  # replace conn.session: every later request must use the original pin.
+  defp authorize_and_inject(store, session, request, headers) do
+    with {:ok, admitted} <- Store.authorize(store, session, request) do
+      Injector.inject(headers, request.host, request.port, request.target, admitted)
     end
   end
 
@@ -1309,16 +1332,22 @@ defmodule Managoat.Broker.Proxy do
   # the broker failing rather than deciding, and a host reading its request
   # log has to be able to tell the two apart without parsing a message.
   defp refusal_error({:credential_missing, _rule, _scheme}), do: :credential_missing
+
+  defp refusal_error(reason) when reason in [:authorization_denied, :authorization_unavailable],
+    do: reason
+
   defp refusal_error(_reason), do: nil
 
+  defp refusal_status(:authorization_unavailable), do: 503
   defp refusal_status(:request_too_large), do: 413
   defp refusal_status({:credential_missing, _rule, _scheme}), do: 502
   defp refusal_status(_reason), do: 403
 
-  # The two a refused request can carry. A `413` is written where the size
+  # The statuses a rule/admission refusal can carry. A `413` is written where the size
   # is checked, which is before any of this.
   defp status_reason(403), do: "Forbidden"
   defp status_reason(502), do: "Bad Gateway"
+  defp status_reason(503), do: "Service Unavailable"
 
   defp emit_finished({request, status, error}), do: emit(request, status, error)
 

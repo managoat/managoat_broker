@@ -262,7 +262,7 @@ defmodule Managoat.Broker.ProxyCase do
        [
          name: name,
          port: 0,
-         store: {Memory, store},
+         store: {Keyword.get(opts, :store_module, Memory), store},
          ca_seed: seed,
          allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, true),
          max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
