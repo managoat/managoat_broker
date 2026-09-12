@@ -10,6 +10,26 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-11
+
+### Added
+
+- Opt-in per-request authorization through `Session.authorization` and
+  `Store.authorize/2` (or `/3` for instance stores). Check pinned authority
+  and return fresh rules before each HTTP request, including inside an
+  already-open CONNECT tunnel. Returned rules are not cached; the original
+  authorization reference, policy, expiry and metadata remain pinned.
+- Fail closed on denied authority (403) or unavailable/missing/broken
+  authorization callbacks (503), with bounded telemetry reasons and no
+  callback payload or exception-message logging. Lookup-only sessions
+  retain their existing behavior.
+
+This release supplies the HTTP admission primitive, not a managed-grant
+custody boundary. Protected rule compilation, protocol-upgrade rejection
+and legacy connection draining are still to build. Hosts must bound callback
+waits, serialize admission with durable revocation and release locks before
+returning; already-admitted requests may finish streaming.
+
 ## [0.11.0] - 2026-09-03
 
 The request event can now say whether a credential was attached. Closes #27,

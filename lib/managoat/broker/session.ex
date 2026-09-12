@@ -7,8 +7,17 @@ defmodule Managoat.Broker.Session do
   A `Managoat.Broker.Store` returns one of these from `lookup/1` with the
   credentials inside `rules` already decrypted. How it is stored, hashed,
   encrypted or swept is the store's business; the proxy looks a token up
-  once per client connection, which is the unit a sandbox's HTTP client
-  pools on.
+  once per CONNECT tunnel and per absolute-form request.
+
+  Set `authorization` to a non-secret, server-controlled reference to opt
+  into `c:Managoat.Broker.Store.authorize/2` (or its instance form) before
+  each HTTP request. It should pin the session and credential generation;
+  it is never populated from a request header. The returned rules apply
+  only to that request. The original reference, expiry, policy and metadata
+  stay pinned for the connection. `nil` preserves lookup-only behavior.
+  Initial rules still govern CONNECT reachability under `:deny`; they can
+  contain patterns without credentials. They are never an authorization
+  fallback. The reference is not included in request telemetry.
 
   `meta` travels unchanged into every `[:managoat, :broker, :request]`
   telemetry event for a request served under the session, so a host that
@@ -22,12 +31,17 @@ defmodule Managoat.Broker.Session do
 
   @type t :: %__MODULE__{
           rules: [Rule.t()],
+          authorization: term() | nil,
           unmatched_host_policy: policy(),
           expires_at: DateTime.t() | nil,
           meta: map()
         }
 
-  defstruct rules: [], unmatched_host_policy: :passthrough, expires_at: nil, meta: %{}
+  defstruct authorization: nil,
+            rules: [],
+            unmatched_host_policy: :passthrough,
+            expires_at: nil,
+            meta: %{}
 
   @doc "True when `expires_at` is set and in the past."
   @spec expired?(t(), DateTime.t()) :: boolean()
