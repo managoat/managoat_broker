@@ -12,7 +12,7 @@ defmodule Managoat.Broker.Proxy do
   absolute-form request. Sessions with non-nil `authorization` also invoke
   the store before every HTTP request inside the tunnel, using fresh rules
   for that request only; see `Managoat.Broker.Store` for the admission
-  contract and its protocol-upgrade limitation.
+  contract. `Session.http_only` separately rejects protocol upgrades.
 
   Absolute-form requests keep the sandbox's connection alive: it may carry
   another, and each one is authenticated, validated, matched against the
@@ -125,7 +125,7 @@ defmodule Managoat.Broker.Proxy do
 
   require Logger
 
-  alias Managoat.Broker.{Certs, HTTP, Injector, Response, Rule, Session, Store}
+  alias Managoat.Broker.{Certs, HTTP, HTTPOnly, Injector, Response, Rule, Session, Store}
   alias ThousandIsland.Socket
 
   @head_timeout 30_000
@@ -415,7 +415,14 @@ defmodule Managoat.Broker.Proxy do
           # forwarded request, including the ones this connection never
           # gets an answer to: `stop_relay/2` tells it why.
           relay =
-            spawn_link(fn -> relay(upstream, client, Response.new(state.max_response_bytes)) end)
+            spawn_link(fn ->
+              relay(
+                upstream,
+                client,
+                Response.new(state.max_response_bytes),
+                HTTPOnly.new(session.http_only)
+              )
+            end)
 
           :ok = :ssl.controlling_process(upstream, relay)
           :ok = :ssl.setopts(upstream, active: :once)
@@ -618,7 +625,7 @@ defmodule Managoat.Broker.Proxy do
 
   # Upstream → sandbox, byte for byte. When the origin closes, the sandbox's
   # side is closed too, which ends `serve/6`.
-  # Origin → sandbox. Every byte is written to the sandbox the instant it
+  # Origin → sandbox. In ordinary sessions every byte is written as it
   # arrives; only then are the same bytes shown to `Managoat.Broker.
   # Response`, which says nothing about what to relay and only works out
   # which request just ended, with what status. So framing cannot delay,
@@ -628,30 +635,43 @@ defmodule Managoat.Broker.Proxy do
   #
   # The upstream socket is in `active: :once` here, which is what lets one
   # `receive` serve both origin bytes and the descriptors `serve/7` sends.
-  defp relay(upstream, client, framer) do
+  # HTTP-only sessions gate bounded response heads before the write; their
+  # bodies still stream. Other sessions retain the observer-only relay.
+  defp relay(upstream, client, framer, gate) do
     receive do
       {:expect, request} ->
-        relay(upstream, client, Response.expect(framer, request))
+        relay(
+          upstream,
+          client,
+          Response.expect(framer, request),
+          HTTPOnly.expect(gate, request.method)
+        )
 
       {:ssl, ^upstream, data} ->
         :ssl.setopts(upstream, active: :once)
 
-        case :ssl.send(client, data) do
-          :ok ->
-            {framer, finished} = Response.observe(framer, data)
-            Enum.each(finished, &emit_finished/1)
+        case HTTPOnly.filter(gate, data) do
+          {:ok, gate, safe} ->
+            case :ssl.send(client, safe) do
+              :ok ->
+                {framer, finished} = Response.observe(framer, safe)
+                Enum.each(finished, &emit_finished/1)
 
-            # A response past its cap has already emitted; closing the
-            # sandbox's side is what tells it the stream ended badly.
-            if Response.halted?(framer) do
-              :ssl.close(client)
-              :ok
-            else
-              relay(upstream, client, framer)
+                if Response.halted?(framer) do
+                  :ssl.close(client)
+                  :ok
+                else
+                  relay(upstream, client, framer, gate)
+                end
+
+              {:error, _} ->
+                finish_relay(framer, &Response.failed(&1, :client_closed))
             end
 
-          {:error, _} ->
-            finish_relay(framer, &Response.failed(&1, :client_closed))
+          {:error, reason} ->
+            finish_relay(framer, &Response.failed(&1, reason))
+            :ssl.close(upstream)
+            :ssl.close(client)
         end
 
       {:ssl_closed, ^upstream} ->
@@ -903,7 +923,8 @@ defmodule Managoat.Broker.Proxy do
         upstream: upstream,
         max_request_bytes: state.max_request_bytes,
         max_response_bytes: state.max_response_bytes,
-        pending: pending_request(session, head, host, {:ok, rule})
+        pending: pending_request(session, head, host, {:ok, rule}),
+        gate: session.http_only |> HTTPOnly.new() |> HTTPOnly.expect(head.method)
       }
 
       outcome = exchange_plain(plain, head, headers, target, rest, deadline)
@@ -1002,8 +1023,13 @@ defmodule Managoat.Broker.Proxy do
   # Keep the admitted rules local to this request. In particular, never
   # replace conn.session: every later request must use the original pin.
   defp authorize_and_inject(store, session, request, headers) do
-    with {:ok, admitted} <- Store.authorize(store, session, request) do
-      Injector.inject(headers, request.host, request.port, request.target, admitted)
+    with :ok <- HTTPOnly.check_request(session.http_only, request.method, headers),
+         {:ok, admitted} <- Store.authorize(store, session, request),
+         {:ok, outgoing, target, rule} <-
+           Injector.inject(headers, request.host, request.port, request.target, admitted),
+         :ok <- HTTPOnly.check_request(session.http_only, request.method, outgoing),
+         :ok <- HTTPOnly.check_framing(session.http_only, headers, outgoing) do
+      {:ok, outgoing, target, rule}
     end
   end
 
@@ -1068,6 +1094,9 @@ defmodule Managoat.Broker.Proxy do
   # the framer. The body is untouched: every byte reaches the sandbox the
   # instant it arrives and the framer sees the same bytes afterwards,
   # exactly as before.
+  defp pump_plain(%{gate: %HTTPOnly{}} = plain, framer, request),
+    do: pump_http_only_plain(plain, framer, request, "")
+
   defp pump_plain(plain, framer, request) do
     case read_response_head(plain.upstream, "") do
       {:ok, response, head_bytes, tail} ->
@@ -1095,6 +1124,53 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
+  defp pump_http_only_plain(plain, framer, request, buffer) do
+    with {:ok, response, head_bytes, tail} <- read_response_head(plain.upstream, buffer),
+         {:ok, gate, _safe_head} <- HTTPOnly.filter(plain.gate, head_bytes) do
+      plain = %{plain | gate: gate}
+
+      if response.status in 100..199 do
+        case Socket.send(plain.client, head_bytes) do
+          :ok ->
+            pump_http_only_plain(plain, observe(framer, head_bytes), request, tail)
+
+          {:error, _} ->
+            finish_relay(framer, &Response.failed(&1, :client_closed))
+            :close
+        end
+      else
+        keep? = keep_alive?(request, response)
+
+        case Socket.send(plain.client, rehead(response, keep?)) do
+          :ok ->
+            filtered_plain(plain, observe(framer, head_bytes), tail, keep?)
+
+          {:error, _} ->
+            finish_relay(framer, &Response.failed(&1, :client_closed))
+            :close
+        end
+      end
+    else
+      {:error, reason} ->
+        finish_relay(framer, &Response.failed(&1, reason))
+        :close
+    end
+  end
+
+  defp filtered_plain(plain, framer, data, keep?) do
+    with {:ok, gate, safe} <- HTTPOnly.filter(plain.gate, data),
+         :ok <- Socket.send(plain.client, safe) do
+      relay_plain(%{plain | gate: gate}, observe(framer, safe), keep?)
+    else
+      {:error, reason} ->
+        reason =
+          if reason in [:upstream_upgrade, :malformed_response], do: reason, else: :client_closed
+
+        finish_relay(framer, &Response.failed(&1, reason))
+        :close
+    end
+  end
+
   # The rest of the body, verbatim, until the framer says the response
   # ended. A response that ends only at the origin's close keeps this loop
   # running to the close, which is what says it ended.
@@ -1111,14 +1187,7 @@ defmodule Managoat.Broker.Proxy do
       true ->
         case :gen_tcp.recv(plain.upstream, 0, @idle_timeout) do
           {:ok, data} ->
-            case Socket.send(plain.client, data) do
-              :ok ->
-                relay_plain(plain, observe(framer, data), keep?)
-
-              {:error, _} ->
-                finish_relay(framer, &Response.failed(&1, :client_closed))
-                :close
-            end
+            filtered_plain(plain, framer, data, keep?)
 
           {:error, :closed} ->
             finish_relay(framer, &Response.closed/1)
@@ -1333,8 +1402,14 @@ defmodule Managoat.Broker.Proxy do
   # log has to be able to tell the two apart without parsing a message.
   defp refusal_error({:credential_missing, _rule, _scheme}), do: :credential_missing
 
-  defp refusal_error(reason) when reason in [:authorization_denied, :authorization_unavailable],
-    do: reason
+  defp refusal_error(reason)
+       when reason in [
+              :authorization_denied,
+              :authorization_unavailable,
+              :protocol_upgrade,
+              :unsafe_request
+            ],
+       do: reason
 
   defp refusal_error(_reason), do: nil
 

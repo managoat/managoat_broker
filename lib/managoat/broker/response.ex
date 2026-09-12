@@ -11,12 +11,15 @@ defmodule Managoat.Broker.Response do
   holds are those of a head that has not arrived in full yet, and that is
   capped.
 
-  Heads are the exception, and only on the absolute-form path, where the
+  Heads are the exception on the absolute-form path, where the
   proxy keeps the sandbox's connection alive: `Connection` describes the
   hop it arrived on, so `Managoat.Broker.Proxy` reads that head in full,
   re-emits it with this hop's own answer and hands the *original* bytes
   here afterwards. What this module frames is therefore always what the
-  origin actually said. Inside a tunnel nothing is held back at all.
+  origin actually said. HTTP-only tunnels also gate heads before the
+  write, preserving accepted header bytes unchanged. They close on 101 or
+  malformed framing; this observer receives only accepted bytes. Other
+  tunnels hold nothing back.
 
   ## What relaying a head verbatim is worth
 
@@ -53,7 +56,9 @@ defmodule Managoat.Broker.Response do
   on the path where the traffic is package managers and the responses are
   short. Spend it again where something needs it and the blast radius is
   understood. In a tunnel that radius is every streamed reply and every
-  clone this proxy exists to carry, which is why it is still whole there.
+  clone this proxy exists to carry. HTTP-only sessions now spend part of
+  that budget on a head gate: malformed heads fail the connection, while
+  accepted header bytes preserve their original casing and bodies stream.
 
   Agent Vault had none of this to weigh. It ran Go's `http.Server` at both
   ends — inside the CONNECT tunnel included (`internal/mitm/connect.go`) —
@@ -93,6 +98,7 @@ defmodule Managoat.Broker.Response do
   | `:client_closed` | the sandbox went away before the relay finished |
   | `:request_too_large` | the request body passed the configured cap |
   | `:response_too_large` | the response body passed the configured cap |
+  | `:upstream_upgrade` | an HTTP-only response gate rejected a 101 before forwarding it |
 
   A response whose head parsed and whose body then failed carries both its
   status and its error.
@@ -116,6 +122,7 @@ defmodule Managoat.Broker.Response do
           | :client_closed
           | :request_too_large
           | :response_too_large
+          | :upstream_upgrade
 
   @typedoc "A finished request: what it was, the status it got, why it failed."
   @type finished :: {request(), 100..599 | nil, reason() | nil}

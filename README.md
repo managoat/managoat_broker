@@ -40,7 +40,7 @@ ingress's job) speaking the two things a forward proxy speaks:
   they are also framed, alongside the relay rather than in front of it, so
   each request's event can say what status it got and how long it took. Keep-alive works; every request on the tunnel is rewritten. A
   WebSocket upgrade is injected like any other request, after which the
-  tunnel is a byte pipe.
+  tunnel is a byte pipe, unless the session opts into HTTP-only enforcement.
 - **Absolute-form requests** (`GET http://host/path`) for plain HTTP. The
   sandbox's connection is kept alive and may carry as many requests as it
   likes, each decided afresh; the origin's connection is this request's
@@ -208,13 +208,52 @@ Admission is that host's serialized authority check: a request admitted
 before revocation may finish, including its streamed response. The next
 request must check again, regardless of missed invalidation notifications.
 
-This is an HTTP admission primitive. **Protected credential rules and
-HTTP-only transport enforcement are not implemented yet.** Ordinary rule
-processing can still rewrite headers and targets, and an accepted protocol
-upgrade still enters a byte pipe; its subsequent operations are not HTTP
-requests to this callback. Do not adopt this primitive alone as a managed
-grant custody/revocation boundary. Those consumers also need protected
-destination compilation, upgrade rejection and legacy connection draining.
+Set `http_only: true` alongside authorization when later operations must
+remain HTTP requests. The callback alone does not authorize operations
+inside an upgraded byte pipe. Protected credential compilation and legacy
+connection draining are still to build; do not adopt these primitives alone
+as a managed-grant custody boundary.
+
+### HTTP-only sessions
+
+`Session.http_only` defaults to `false`, preserving ordinary WebSocket and
+other upgrade behavior. A server-controlled `true` pins the session to
+HTTP request/response traffic, independently of which rules the request
+matches or what its authorization callback returns.
+
+- Reject any client `Upgrade` header (including empty values), any
+  `Connection` or `Proxy-Connection` occurrence containing the `upgrade`
+  token, and a nested CONNECT inside the intercepted tunnel. Check before
+  credential resolution, then check the effective headers after templates
+  and substitution. Refusals return 403 with `error: :protocol_upgrade`
+  and close; no rejected request is forwarded to the origin. Invalid
+  header names and value control characters also return 403 with
+  `error: :unsafe_request`, so a template cannot manufacture hidden wire
+  headers with a newline in an unrelated value. Reject ambiguous request
+  lengths/codings and any rule-induced change to body framing, so body
+  bytes cannot become an unchecked next request at the origin. Ordinary
+  proxy CONNECT for TLS interception remains supported.
+- Hold each upstream response head until it parses and passes the policy.
+  An unexpected 101 closes both sides without forwarding its handshake
+  or trailing frames. Its event has `error: :upstream_upgrade` and no
+  status, because no final response head was accepted. Informational
+  responses do not exempt the following final head from the check.
+- Bound response heads at 64 KiB and reject malformed/ambiguous framing,
+  including duplicate Content-Length, conflicting length/transfer coding,
+  and transfer codings other than chunked. This stricter parsing applies
+  only to opted-in sessions. A rejected packet is discarded in full,
+  potentially truncating safe bytes that preceded the bad head in it.
+- Preserve accepted header bytes inside CONNECT and stream response
+  bodies as they arrive. HEAD, chunked responses/trailers, informational
+  responses, and keep-alive still work. Plain HTTP retains its hop-specific
+  Connection rewrite and keep-alive. This does not cap stream duration or
+  recall a request admitted before revocation.
+
+Hosts must set the policy when issuing sessions. Existing cached sessions
+and already-upgraded sockets do not acquire it retroactively: invalidate
+and drain them on every serving node before adopting the protected path.
+The library does not provide that deployment-wide drain mechanism or a
+protected destination/credential compiler yet.
 
 ### Connections, and who decides them
 
@@ -356,10 +395,10 @@ and avoids a second event and a row-update protocol. If immediate
 visibility for long-lived requests is ever needed, that is correlated
 start/stop events, not more meaning packed into this one.
 
-Framing never touches the relay. Every byte from the origin is written to
-the sandbox the instant it arrives, and only then shown to the framer, so a
-streaming reply streams exactly as it did before responses were parsed and
-a framing failure costs telemetry rather than the response.
+For ordinary sessions, framing only observes the relay: every byte is
+written to the sandbox before the framer sees it. HTTP-only sessions add a
+response-head gate before the write, so malformed framing can close the
+connection. Accepted body bytes still stream in both modes.
 
 `path` is the URL path and nothing else. A query string never appears in
 it, on either request path, because a query can already hold a credential

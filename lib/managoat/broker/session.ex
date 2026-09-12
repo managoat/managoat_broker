@@ -19,6 +19,13 @@ defmodule Managoat.Broker.Session do
   contain patterns without credentials. They are never an authorization
   fallback. The reference is not included in request telemetry.
 
+  Set `http_only: true` for sessions that must not upgrade protocols. It
+  rejects raw and rule-produced upgrade requests (and nested CONNECT), and
+  validates bounded upstream response heads before releasing them. An
+  unexpected 101 or malformed response closes the connection. Bodies still
+  stream; the default `false` preserves ordinary upgrade support. This
+  policy stays pinned when per-request authorization returns new rules.
+
   `meta` travels unchanged into every `[:managoat, :broker, :request]`
   telemetry event for a request served under the session, so a host that
   puts a conversation id and a user id there gets them back on each log
@@ -32,12 +39,14 @@ defmodule Managoat.Broker.Session do
   @type t :: %__MODULE__{
           rules: [Rule.t()],
           authorization: term() | nil,
+          http_only: boolean(),
           unmatched_host_policy: policy(),
           expires_at: DateTime.t() | nil,
           meta: map()
         }
 
   defstruct authorization: nil,
+            http_only: false,
             rules: [],
             unmatched_host_policy: :passthrough,
             expires_at: nil,

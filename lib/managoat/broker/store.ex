@@ -64,8 +64,9 @@ defmodule Managoat.Broker.Store do
   and the original target (which may contain a query). Do not log it as a
   whole. This callback is an HTTP admission primitive, not a protected
   credential compiler or authorization of traffic after a protocol upgrade.
-  Hosts requiring that boundary must also enforce HTTP-only transport and
-  protected rule processing; those policies are not implemented here yet.
+  Hosts requiring that boundary must also set `Session.http_only: true`
+  and use protected rule processing. Protected credential compilation and
+  draining legacy connections are not implemented here yet.
   """
   @callback authorize(authorization :: term(), request()) :: authorization_result()
 
