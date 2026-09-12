@@ -26,7 +26,7 @@ defmodule Managoat.Broker.Store do
   for tests and for a consumer without a database.
   """
 
-  alias Managoat.Broker.{Rule, Session}
+  alias Managoat.Broker.{ProtectedCredential, Rule, Session}
 
   @doc "The session for a raw token, or `:error` for a token the store does not know."
   @callback lookup(token :: binary()) :: {:ok, Session.t()} | :error
@@ -36,6 +36,7 @@ defmodule Managoat.Broker.Store do
 
   @typedoc "Actual proxy destination and original request line, before rule processing."
   @type request :: %{
+          optional(:protected) => true,
           scheme: :http | :https,
           host: binary(),
           port: :inet.port_number(),
@@ -44,7 +45,8 @@ defmodule Managoat.Broker.Store do
         }
 
   @typedoc "Fresh rules for this request, or a bounded refusal reason."
-  @type authorization_result :: {:ok, [Rule.t()]} | {:error, :denied | :unavailable}
+  @type authorization_result ::
+          {:ok, [Rule.t()] | ProtectedCredential.t()} | {:error, :denied | :unavailable}
 
   @doc """
   Admit one HTTP request for the session's server-controlled authorization
@@ -64,9 +66,12 @@ defmodule Managoat.Broker.Store do
   and the original target (which may contain a query). Do not log it as a
   whole. This callback is an HTTP admission primitive, not a protected
   credential compiler or authorization of traffic after a protocol upgrade.
-  Hosts requiring that boundary must also set `Session.http_only: true`
-  and use protected rule processing. Protected credential compilation and
-  draining legacy connections are not implemented here yet.
+  Set `Session.protected` and `http_only: true` for the protected path: the
+  request then carries the proxy-supplied `protected: true` marker, and this
+  callback must return a `ProtectedCredential` matching the policy's identity,
+  instead of ordinary rules. The proxy never supplies that credential to
+  generic rule processing. Host-side policy compilation, durable session/grant
+  fencing and legacy connection draining remain the host's responsibility.
   """
   @callback authorize(authorization :: term(), request()) :: authorization_result()
 
@@ -96,6 +101,23 @@ defmodule Managoat.Broker.Store do
       store
       |> call_authorize(session.authorization, request)
       |> authorized_session(session)
+    end
+  rescue
+    _ -> {:error, :authorization_unavailable}
+  catch
+    _, _ -> {:error, :authorization_unavailable}
+  end
+
+  @doc false
+  def authorize_protected(store, %Session{} = session, request) do
+    if Session.expired?(session, DateTime.utc_now()) do
+      {:error, :authorization_denied}
+    else
+      case call_authorize(store, session.authorization, Map.put(request, :protected, true)) do
+        {:ok, %ProtectedCredential{} = credential} -> {:ok, credential}
+        {:error, :denied} -> {:error, :authorization_denied}
+        _ -> {:error, :authorization_unavailable}
+      end
     end
   rescue
     _ -> {:error, :authorization_unavailable}

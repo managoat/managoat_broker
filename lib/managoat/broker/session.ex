@@ -26,13 +26,19 @@ defmodule Managoat.Broker.Session do
   stream; the default `false` preserves ordinary upgrade support. This
   policy stays pinned when per-request authorization returns new rules.
 
+  `protected` optionally pins one `Managoat.Broker.ProtectedRule`, without
+  its bearer. It requires authorization and HTTP-only mode; protected requests
+  resolve a separate typed credential on each admission. Other destinations
+  keep ordinary rule behavior. See `Managoat.Broker.ProtectedRule` for the
+  custody boundary and the host's policy/legacy-draining obligations.
+
   `meta` travels unchanged into every `[:managoat, :broker, :request]`
   telemetry event for a request served under the session, so a host that
   puts a conversation id and a user id there gets them back on each log
   line without the library knowing what either is.
   """
 
-  alias Managoat.Broker.Rule
+  alias Managoat.Broker.{ProtectedRule, Rule}
 
   @type policy :: :passthrough | :deny
 
@@ -40,6 +46,7 @@ defmodule Managoat.Broker.Session do
           rules: [Rule.t()],
           authorization: term() | nil,
           http_only: boolean(),
+          protected: ProtectedRule.t() | nil,
           unmatched_host_policy: policy(),
           expires_at: DateTime.t() | nil,
           meta: map()
@@ -47,6 +54,7 @@ defmodule Managoat.Broker.Session do
 
   defstruct authorization: nil,
             http_only: false,
+            protected: nil,
             rules: [],
             unmatched_host_policy: :passthrough,
             expires_at: nil,

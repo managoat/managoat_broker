@@ -210,9 +210,9 @@ request must check again, regardless of missed invalidation notifications.
 
 Set `http_only: true` alongside authorization when later operations must
 remain HTTP requests. The callback alone does not authorize operations
-inside an upgraded byte pipe. Protected credential compilation and legacy
-connection draining are still to build; do not adopt these primitives alone
-as a managed-grant custody boundary.
+inside an upgraded byte pipe. Protected credentials additionally require
+`Session.protected`, described below, and hosts must drain legacy connections
+before adopting the custody boundary.
 
 ### HTTP-only sessions
 
@@ -252,8 +252,80 @@ matches or what its authorization callback returns.
 Hosts must set the policy when issuing sessions. Existing cached sessions
 and already-upgraded sockets do not acquire it retroactively: invalidate
 and drain them on every serving node before adopting the protected path.
-The library does not provide that deployment-wide drain mechanism or a
-protected destination/credential compiler yet.
+The library does not provide that deployment-wide drain mechanism.
+
+### Protected credentials
+
+A host may pin **one protected bearer per session**, separately from ordinary
+rules. The policy is non-secret and server-controlled; neither account owners
+nor sandbox headers may construct it or widen it. There are no provider-specific
+defaults in the library:
+
+```elixir
+%Managoat.Broker.Session{
+  authorization: pinned_session_and_grant_reference,
+  http_only: true,
+  protected: %Managoat.Broker.ProtectedRule{
+    name: "subscription",
+    host: "provider.example",
+    port: 443,
+    paths: ["/responses", "/models/"],
+    methods: ["GET", "POST"],
+    identity: "account-123",
+    identity_header: "x-account-id",
+    allowed_headers: ["content-type", "accept"]
+  },
+  rules: ordinary_rules
+}
+```
+
+The store's existing `authorize/2` or instance callback receives the original
+request with **`protected: true`**, added by the proxy, and must return
+`{:ok, %Managoat.Broker.ProtectedCredential{bearer: fresh_token, identity: "account-123"}}`.
+It must check the durable session/owner/grant/generation binding and obtain
+both values from that same authorized read. The identity must equal the
+policy's pinned identity. Denied authority is 403; an unavailable, malformed,
+wrong-shaped or mismatched-identity result is 503. The credential has redacted
+Inspect and no JSON encoder. It never enters an ordinary rule, template map,
+substitution, session cache, or telemetry record. Do not put its fields there
+in host code either.
+
+The proxy enforces the policy independently of what ordinary rules say:
+
+- Protected requests use the exact HTTPS host/port and approved HTTP methods.
+  TRACE and CONNECT are never permitted. Paths match exactly; a trailing slash
+  explicitly permits that subtree. Encoded/ambiguous paths, dot segments,
+  backslashes and fragments are denied. Queries pass through unchanged.
+- A matching ordinary injection rule is a conflict (403) before credential
+  resolution; passthrough rules are harmless. Rules for other destinations
+  still work. That ordinary path receives no protected credential, and a
+  typed credential mistakenly returned there is rejected.
+- The proxy supplies Host, Authorization and the pinned identity header.
+  Client values cannot override them. Only allowlisted headers and
+  Content-Length survive; cookies, routing overrides and hop headers are
+  excluded. Protected request bodies must have a Content-Length or no body;
+  chunked requests/trailers are refused to prevent identity changes in trailers.
+  Response bodies still stream. Hosts must verify routes, methods, headers
+  and request framing against their supported client before adoption.
+- Protected TLS always verifies the certificate chain and actual destination
+  name. Listener options cannot disable verification, replace the hostname
+  check/SNI, or resume a previously weaker TLS session. Configured trust roots
+  remain the host's responsibility. The proxy never follows redirects; a
+  client's request to the redirected destination gets a separate decision
+  and cannot carry the injected bearer through the ordinary rule path.
+
+`ProtectedRule.valid_session?/1` checks persisted policy without credentials.
+Invalid policies, missing authorization references, or disabled HTTP-only mode
+are rejected at initial lookup. The rule supplies CONNECT reachability under
+`:deny`, but the HTTP request still needs fresh authorization. Protected
+request events use `scheme: :protected_bearer`; `:protected_destination` and
+`:protected_conflict` identify policy refusals without secret payloads.
+
+The host must still enforce write-time policy ownership, prevent reserved
+credential aliases in its compiler, fence issuance/updates with revocation,
+and drain legacy sessions on every node. Fountain's protected compiler,
+provider-specific routes/client fixture, durable broker fencing and drain
+integration are not part of this library release.
 
 ### Connections, and who decides them
 

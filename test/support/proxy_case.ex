@@ -52,6 +52,11 @@ defmodule Managoat.Broker.ProxyCase do
 
     # An origin that plants a cookie, for the deviation the parity suite
     # pins: `Set-Cookie` reaches the sandbox rather than being stripped.
+    def call(%{request_path: "/redirect"} = conn, _opts) do
+      [location] = get_req_header(conn, "x-redirect-to")
+      conn |> put_resp_header("location", location) |> send_resp(302, "{}")
+    end
+
     def call(%{request_path: "/cookie"} = conn, _opts) do
       conn
       |> put_resp_cookie("session", "planted", http_only: false)
@@ -267,9 +272,15 @@ defmodule Managoat.Broker.ProxyCase do
          allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, true),
          max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
          max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity),
-         upstream_ssl_options: [
-           cacerts: [X509.Certificate.to_der(origin_ca) | Keyword.get(opts, :extra_cacerts, [])]
-         ]
+         upstream_ssl_options:
+           Keyword.merge(
+             [
+               cacerts: [
+                 X509.Certificate.to_der(origin_ca) | Keyword.get(opts, :extra_cacerts, [])
+               ]
+             ],
+             Keyword.get(opts, :upstream_ssl_options, [])
+           )
        ] ++ Keyword.take(opts, [:request_read_timeout])}
     )
 

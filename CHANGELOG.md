@@ -10,6 +10,28 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-12
+
+### Added
+
+- `Session.protected` pins an exact HTTPS destination, routes, HTTP methods,
+  public account identity and safe-header allowlist. It requires HTTP-only
+  mode and per-request authorization. `ProtectedRule.valid_session?/1`
+  validates persisted configuration without resolving credentials.
+- Protected requests ask the store for a redacted `ProtectedCredential` with
+  a matching identity, separately from ordinary rules. Bearers are injected
+  only in Authorization; ordinary templates/substitution never receive them.
+  Conflicting injection rules fail closed, and redirects do not carry the
+  credential to another destination. Chunked request trailers are refused;
+  response streaming remains supported.
+- Mandatory chain/hostname verification for protected TLS, independent of
+  listener verification overrides and prior TLS session resumption.
+- `:protected_bearer` telemetry scheme and bounded protected-policy refusals.
+
+The host still owns policy construction, provider/client compatibility,
+reserved-key validation, durable issuance/revocation fencing and legacy socket
+draining. This release does not switch Fountain to the protected path.
+
 ## [0.13.0] - 2026-09-12
 
 ### Added

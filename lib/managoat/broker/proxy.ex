@@ -125,7 +125,18 @@ defmodule Managoat.Broker.Proxy do
 
   require Logger
 
-  alias Managoat.Broker.{Certs, HTTP, HTTPOnly, Injector, Response, Rule, Session, Store}
+  alias Managoat.Broker.{
+    Certs,
+    HTTP,
+    HTTPOnly,
+    Injector,
+    ProtectedRule,
+    Response,
+    Rule,
+    Session,
+    Store
+  }
+
   alias ThousandIsland.Socket
 
   @head_timeout 30_000
@@ -222,8 +233,9 @@ defmodule Managoat.Broker.Proxy do
   # Under `deny`, a host no rule could match is refused at CONNECT, before
   # a tunnel exists; paths are only known per request, so a host that
   # matches some rule still gets its per-request check inside the tunnel.
-  defp reachable?(%Session{unmatched_host_policy: :deny, rules: rules}, host, port) do
-    Enum.any?(rules, &Injector.host_matches?(&1.pattern, host, port))
+  defp reachable?(%Session{unmatched_host_policy: :deny, rules: rules} = session, host, port) do
+    ProtectedRule.destination?(session, host, port) or
+      Enum.any?(rules, &Injector.host_matches?(&1.pattern, host, port))
   end
 
   defp reachable?(_session, _host, _port), do: true
@@ -367,8 +379,11 @@ defmodule Managoat.Broker.Proxy do
 
   defp lookup(store, token) do
     case Store.lookup(store, token) do
-      {:ok, %Session{}} = ok -> ok
-      _ -> :error
+      {:ok, %Session{} = session} ->
+        if ProtectedRule.valid_session?(session), do: {:ok, session}, else: :error
+
+      _ ->
+        :error
     end
   end
 
@@ -397,6 +412,8 @@ defmodule Managoat.Broker.Proxy do
   # CONNECT: a TLS tunnel the proxy terminates on both ends
 
   defp tunnel(socket, host, port, session, state) do
+    state = Map.put(state, :protected_tls, ProtectedRule.destination?(session, host, port))
+
     with {:ok, addresses} <- resolve(socket, host, port, state),
          {:ok, upstream} <- connect_tls(socket, addresses, host, port, state) do
       Socket.send(socket, "HTTP/1.1 200 Connection established\r\n\r\n")
@@ -1023,8 +1040,25 @@ defmodule Managoat.Broker.Proxy do
   # Keep the admitted rules local to this request. In particular, never
   # replace conn.session: every later request must use the original pin.
   defp authorize_and_inject(store, session, request, headers) do
-    with :ok <- HTTPOnly.check_request(session.http_only, request.method, headers),
-         {:ok, admitted} <- Store.authorize(store, session, request),
+    with :ok <- HTTPOnly.check_request(session.http_only, request.method, headers) do
+      case ProtectedRule.select(session, request) do
+        :ordinary ->
+          ordinary_inject(store, session, request, headers)
+
+        {:ok, policy} ->
+          with {:ok, outgoing} <- ProtectedRule.prepare(policy, session, request, headers),
+               {:ok, credential} <- Store.authorize_protected(store, session, request) do
+            ProtectedRule.inject(policy, credential, outgoing, request.target)
+          end
+
+        {:error, _} = error ->
+          error
+      end
+    end
+  end
+
+  defp ordinary_inject(store, session, request, headers) do
+    with {:ok, admitted} <- Store.authorize(store, session, request),
          {:ok, outgoing, target, rule} <-
            Injector.inject(headers, request.host, request.port, request.target, admitted),
          :ok <- HTTPOnly.check_request(session.http_only, request.method, outgoing),
@@ -1281,6 +1315,26 @@ defmodule Managoat.Broker.Proxy do
 
   # A pure keyword list, so `Keyword.merge` with the host's options works.
   defp upstream_ssl_options(host, address, state) do
+    overrides =
+      if Map.get(state, :protected_tls, false) do
+        state.upstream_ssl_options
+        |> Keyword.drop([
+          :verify,
+          :verify_fun,
+          :partial_chain,
+          :customize_hostname_check,
+          :server_name_indication,
+          :alpn_advertised_protocols,
+          :reuse_session,
+          :reuse_sessions,
+          :use_ticket,
+          :session_tickets
+        ])
+        |> Keyword.merge(reuse_sessions: false, session_tickets: :disabled)
+      else
+        state.upstream_ssl_options
+      end
+
     [
       mode: :binary,
       active: false,
@@ -1291,7 +1345,7 @@ defmodule Managoat.Broker.Proxy do
       depth: 5
     ]
     |> Keyword.merge(sni(host))
-    |> Keyword.merge(state.upstream_ssl_options)
+    |> Keyword.merge(overrides)
     |> Kernel.++([family(address)])
   end
 
@@ -1346,6 +1400,7 @@ defmodule Managoat.Broker.Proxy do
       case decision do
         {:ok, nil} -> {:passthrough, nil, nil}
         {:ok, %Rule{} = rule} -> {:injected, rule.name, rule.scheme}
+        {:ok, %ProtectedRule{name: name}} -> {:injected, name, :protected_bearer}
         {:error, _} -> {:denied, nil, nil}
       end
 
@@ -1407,7 +1462,9 @@ defmodule Managoat.Broker.Proxy do
               :authorization_denied,
               :authorization_unavailable,
               :protocol_upgrade,
-              :unsafe_request
+              :unsafe_request,
+              :protected_destination,
+              :protected_conflict
             ],
        do: reason
 
