@@ -82,6 +82,14 @@ defmodule Managoat.Broker.Proxy do
   it is provisioned. Inside a tunnel that `502` refuses the request without
   ending the tunnel, where the refused request left no body behind it.
 
+  A response can be refused too, for a protected request only: one that
+  repeats the bearer it was sent with (`error: :credential_reflected`) or
+  arrives in a `Content-Encoding` that cannot be searched for it (`error:
+  :protected_response_encoded`). The sandbox gets a fixed `502` where none
+  of the response had been forwarded, and a cut stream otherwise; the
+  connection closes either way. `Managoat.Broker.ProtectedRule` has the
+  contract, including what is and is not recognised.
+
   Beside it, every connection the proxy decides about emits `[:managoat,
   :broker, :connect]` with `%{count: 1}` and the metadata `host`, `port`,
   `outcome` (`:ok`, `:upstream_failed`, `:denied` or `:unauthenticated`)
@@ -131,6 +139,7 @@ defmodule Managoat.Broker.Proxy do
     HTTPOnly,
     Injector,
     ProtectedRule,
+    ReflectionGuard,
     Response,
     Rule,
     Session,
@@ -165,6 +174,16 @@ defmodule Managoat.Broker.Proxy do
   # deliberately not bounded by it: a `git clone` or an SSE stream runs long
   # on the way back, and that is the traffic this proxy exists for.
   @request_read_timeout 300_000
+
+  # What the sandbox gets in place of a protected response that was refused
+  # before any of it was forwarded. Fixed, so nothing of the refused
+  # response can ride out in it.
+  @refused_body "The broker refused the upstream response.\n"
+  @refused_response [
+    "HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\nconnection: close\r\n",
+    "content-length: #{byte_size(@refused_body)}\r\n\r\n",
+    @refused_body
+  ]
 
   # How long the handler waits for the relay to emit the terminal events
   # for requests that never got an answer. A telemetry event is not worth
@@ -656,12 +675,16 @@ defmodule Managoat.Broker.Proxy do
   # bodies still stream. Other sessions retain the observer-only relay.
   defp relay(upstream, client, framer, gate) do
     receive do
-      {:expect, request} ->
+      # `secrets` is what this request's response is searched for: the
+      # bearer of a protected request, and nil for every other. It rides
+      # beside the descriptor and never in it, because the descriptor is
+      # what the telemetry event is built from.
+      {:expect, request, secrets} ->
         relay(
           upstream,
           client,
           Response.expect(framer, request),
-          HTTPOnly.expect(gate, request.method)
+          HTTPOnly.expect(gate, request.method, ReflectionGuard.new(secrets))
         )
 
       {:ssl, ^upstream, data} ->
@@ -686,12 +709,16 @@ defmodule Managoat.Broker.Proxy do
             end
 
           {:error, reason} ->
-            finish_relay(framer, &Response.failed(&1, reason))
+            refuse_response(client, framer, reason)
             :ssl.close(upstream)
             :ssl.close(client)
         end
 
       {:ssl_closed, ^upstream} ->
+        # What a reflection guard was holding back belongs to a body that
+        # only this close ends. It was never the bearer, or it would not
+        # have been held.
+        _ = client_tls_send(client, HTTPOnly.closed(gate))
         :ssl.close(client)
         finish_relay(framer, &Response.closed/1)
 
@@ -704,6 +731,54 @@ defmodule Managoat.Broker.Proxy do
         send(from, {:relay_stopped, ref})
     end
   end
+
+  # The response gate said no. For an upgrade or a malformed head that is
+  # the end of it, as before. A protected response that repeated its bearer,
+  # or came in a coding that cannot be searched, is also said out loud, and
+  # the sandbox is told where it can be: if everything forwarded so far
+  # ended on a response boundary, a `502` of the proxy's own is a well-formed
+  # answer to the refused request. Anywhere else (the head already went, or
+  # the rejected packet began inside an earlier response) there is nothing
+  # honest left to write and the close is the answer.
+  #
+  # The log line and the event name the request, never the value: the
+  # descriptor was built before the bearer existed and the gate returns a
+  # reason, not the bytes that matched.
+  defp refuse_response(client, framer, reason)
+       when reason in [:credential_reflected, :protected_response_encoded] do
+    log_refused_response(Response.outstanding(framer), reason)
+
+    if Response.boundary?(framer) do
+      _ = :ssl.send(client, @refused_response)
+      {_framer, finished} = Response.failed(framer, reason)
+
+      # The first is the request that was just answered; any behind it on
+      # the tunnel were pipelined and never got an answer at all.
+      finished
+      |> Enum.with_index()
+      |> Enum.each(fn
+        {{request, _status, error}, 0} -> emit(request, 502, error)
+        {unanswered, _} -> emit_finished(unanswered)
+      end)
+    else
+      finish_relay(framer, &Response.failed(&1, reason))
+    end
+  end
+
+  defp refuse_response(_client, framer, reason),
+    do: finish_relay(framer, &Response.failed(&1, reason))
+
+  defp log_refused_response(request, reason) do
+    Logger.warning(
+      "broker: refused a protected response (#{reason}) to " <>
+        "#{request[:method]} #{request[:host]}#{request[:path]}, rule " <>
+        "#{inspect(request[:rule])}, session #{inspect(request[:meta])}. Nothing more of " <>
+        "it was forwarded and the connection was closed."
+    )
+  end
+
+  defp client_tls_send(_client, ""), do: :ok
+  defp client_tls_send(client, bytes), do: :ssl.send(client, bytes)
 
   defp finish_relay(framer, fun) do
     {_framer, finished} = fun.(framer)
@@ -800,7 +875,7 @@ defmodule Managoat.Broker.Proxy do
 
         # Before the write, never after: an origin may answer faster than
         # the next line of code runs.
-        send(conn.relay, {:expect, request})
+        send(conn.relay, {:expect, request, ProtectedRule.response_secrets(rule, headers)})
 
         encoded = HTTP.encode_request(%{head | headers: headers}, target)
 
@@ -1464,7 +1539,8 @@ defmodule Managoat.Broker.Proxy do
               :protocol_upgrade,
               :unsafe_request,
               :protected_destination,
-              :protected_conflict
+              :protected_conflict,
+              :protected_query
             ],
        do: reason
 

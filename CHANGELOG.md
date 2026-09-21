@@ -10,6 +10,62 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-21
+
+Two gates on the protected path, both on by default. **Breaking for a host
+whose protected routes take a query string**, and for nobody else; see
+"Upgrading".
+
+### Added
+
+- **A protected response that repeats its bearer is refused.** Every response
+  to a protected request is searched for the bearer that request was sent
+  with: the whole head before any of it is released, and the body as it
+  streams. The body is searched decoded from chunked framing, so a chunk
+  boundary inside the value does not hide it, and bytes that could be the
+  start of the value are held until the next read settles them, so a value
+  split across reads is caught before its first half is forwarded. Nothing is
+  accumulated; ordinarily nothing waits, and at most `byte_size(bearer) - 1`
+  bytes do. On a match nothing more is forwarded and the connection closes;
+  where the sandbox had been sent none of the response it gets a fixed `502`.
+  The request event carries `error: :credential_reflected` and a warning is
+  logged with the route, rule and session `meta`, never the value or the bytes
+  that matched. Refused, not scrubbed, and there is no option to turn it off.
+  Recognised: the bearer's exact bytes (so `Bearer <value>` too) and its JSON
+  spelling with `\/`. Not recognised: base64, hex, percent-encoding or any
+  other transformation, a partial copy, an undeclared compression, or a copy
+  on another request or connection.
+- **Protected requests ask for `Accept-Encoding: identity`**, replacing
+  whatever the client sent even where `allowed_headers` names the header,
+  because a compressed body cannot be searched. A response that carries any
+  other `Content-Encoding` anyway is refused unread with a `502` and `error:
+  :protected_response_encoded`. A chunk extension on a searched response is
+  refused as `:malformed_response`.
+- **`ProtectedRule.query`, `:refuse` (the default) or `:allow`.** Under
+  `:refuse` a target holding a `?` on a protected route, a bare `path?`
+  included, is a `403` with `error: :protected_query`, decided before the
+  credential is resolved. Until now the path alone was matched and any query
+  the sandbox wrote went out under the bearer. `:allow` is the old behaviour.
+  A policy persisted without the key reads as `:refuse`.
+
+Responses to requests that are not protected are not searched and are relayed
+exactly as before, in the same session and on the same tunnel.
+
+### Upgrading
+
+- A host whose pinned client sends a query string on a protected route must set
+  `query: :allow` on that `ProtectedRule`, or those requests become `403`s.
+  A host whose client sends none (Fountain's Codex route) needs no change to
+  get the refusal.
+- An origin that answers a protected route with `Content-Encoding` despite
+  `Accept-Encoding: identity` is now refused. Check the pinned origin honours
+  it before adopting.
+- A test origin that echoes request headers back (as this suite's did) is now
+  refused on a protected route, which is the feature; have it report what it
+  saw some other way.
+- New `error` values on the request event: `:protected_query`,
+  `:credential_reflected`, `:protected_response_encoded`.
+
 ## [0.14.0] - 2026-09-12
 
 ### Added

@@ -99,6 +99,8 @@ defmodule Managoat.Broker.Response do
   | `:request_too_large` | the request body passed the configured cap |
   | `:response_too_large` | the response body passed the configured cap |
   | `:upstream_upgrade` | an HTTP-only response gate rejected a 101 before forwarding it |
+  | `:credential_reflected` | the response to a protected request held the bearer it was sent with, and was cut |
+  | `:protected_response_encoded` | the response to a protected request came in a `Content-Encoding` that cannot be searched, and was refused |
 
   A response whose head parsed and whose body then failed carries both its
   status and its error.
@@ -123,6 +125,8 @@ defmodule Managoat.Broker.Response do
           | :request_too_large
           | :response_too_large
           | :upstream_upgrade
+          | :credential_reflected
+          | :protected_response_encoded
 
   @typedoc "A finished request: what it was, the status it got, why it failed."
   @type finished :: {request(), 100..599 | nil, reason() | nil}
@@ -184,6 +188,21 @@ defmodule Managoat.Broker.Response do
   @spec idle?(t()) :: boolean()
   def idle?(%__MODULE__{current: nil, pending: pending}), do: pending == []
   def idle?(%__MODULE__{}), do: false
+
+  @doc """
+  Is the sandbox between responses: everything forwarded so far ended
+  where a response ends? Only then can the proxy write a response of its
+  own without it landing in the middle of someone else's.
+  """
+  @spec boundary?(t()) :: boolean()
+  def boundary?(%__MODULE__{mode: :framing, current: nil, buffer: ""}), do: true
+  def boundary?(%__MODULE__{}), do: false
+
+  @doc "The request whose response is next, or under way. Nil when idle."
+  @spec outstanding(t()) :: request() | nil
+  def outstanding(%__MODULE__{current: {request, _status, _framing}}), do: request
+  def outstanding(%__MODULE__{pending: [request | _]}), do: request
+  def outstanding(%__MODULE__{}), do: nil
 
   @doc """
   Feed the bytes that just came back. Returns the new state and the

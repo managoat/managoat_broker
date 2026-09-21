@@ -51,7 +51,9 @@ defmodule Managoat.Broker.ProtectedRuleTest do
           allowed_headers: ["host"],
           allowed_headers: ["x-forwarded-host"],
           allowed_headers: ["cookie"],
-          name: 12
+          name: 12,
+          query: :forward,
+          query: nil
         ] do
       refute ProtectedRule.valid_session?(session(struct!(policy, [change]))), inspect(change)
     end
@@ -60,7 +62,7 @@ defmodule Managoat.Broker.ProtectedRuleTest do
   test "exact paths and explicit subtrees do not widen to adjacent routes" do
     policy = policy()
 
-    for target <- ["/responses", "/responses?model=test", "/api/", "/api/nested/route"] do
+    for target <- ["/responses", "/api/", "/api/nested/route"] do
       assert {:ok, ^policy} = ProtectedRule.select(session(policy), request(target))
     end
 
@@ -94,6 +96,46 @@ defmodule Managoat.Broker.ProtectedRuleTest do
              ProtectedRule.select(session(policy), %{request("/responses") | port: 8443})
   end
 
+  test "a query on a protected route is refused unless the policy allows one" do
+    policy = policy()
+    assert policy.query == :refuse
+
+    for target <- ["/responses?model=test", "/responses?", "/api/nested?x=1", "/responses??"] do
+      assert {:error, :protected_query} = ProtectedRule.select(session(policy), request(target))
+    end
+
+    allowing = %{policy | query: :allow}
+    assert ProtectedRule.valid_session?(session(allowing))
+
+    for target <- ["/responses", "/responses?model=test", "/responses?"] do
+      assert {:ok, ^allowing} = ProtectedRule.select(session(allowing), request(target))
+    end
+
+    # The path is judged first, so a wrong route says so whatever follows it.
+    for policy <- [policy, allowing], target <- ["/other?x=1", "/responses#frag?x=1"] do
+      assert {:error, :protected_destination} =
+               ProtectedRule.select(session(policy), request(target))
+    end
+
+    # A policy persisted before the key existed reads as the default.
+    legacy = Map.delete(policy, :query)
+    assert ProtectedRule.valid_session?(session(legacy))
+    assert {:ok, _} = ProtectedRule.select(session(legacy), request("/responses"))
+
+    assert {:error, :protected_query} =
+             ProtectedRule.select(session(legacy), request("/responses?x=1"))
+  end
+
+  test "an allowlisted Accept-Encoding is still replaced with identity" do
+    policy = %{policy() | allowed_headers: ["accept-encoding"]}
+
+    assert {:ok, [{"host", "provider.example"}, {"accept-encoding", "identity"}]} =
+             ProtectedRule.prepare(policy, session(policy), request("/responses"), [
+               {"accept-encoding", "gzip"},
+               {"Accept-Encoding", "zstd"}
+             ])
+  end
+
   test "only safe headers, the pinned identity and a fresh bearer are emitted" do
     policy = %{policy() | allowed_headers: ["content-type", "x-account-id"]}
 
@@ -103,6 +145,7 @@ defmodule Managoat.Broker.ProtectedRuleTest do
       {"X-Account-ID", "other"},
       {"Content-Type", "application/json"},
       {"Content-Length", "2"},
+      {"Accept-Encoding", "gzip, br"},
       {"X-Unknown", "drop"}
     ]
 
@@ -118,6 +161,7 @@ defmodule Managoat.Broker.ProtectedRuleTest do
              {"authorization", "Bearer fresh-token"},
              {"x-account-id", "acct-1"},
              {"host", "provider.example"},
+             {"accept-encoding", "identity"},
              {"Content-Type", "application/json"},
              {"Content-Length", "2"}
            ]
@@ -173,7 +217,7 @@ defmodule Managoat.Broker.ProtectedRuleTest do
     assert ProtectedRule.destination?(session(policy), "::1", 8443)
     refute ProtectedRule.destination?(session(policy), "::1", 443)
 
-    assert {:ok, [{"host", "[::1]:8443"}]} =
+    assert {:ok, [{"host", "[::1]:8443"}, {"accept-encoding", "identity"}]} =
              ProtectedRule.prepare(
                policy,
                session(policy),

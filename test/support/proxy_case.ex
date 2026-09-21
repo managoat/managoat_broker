@@ -72,13 +72,80 @@ defmodule Managoat.Broker.ProxyCase do
       |> send_resp(200, "closing")
     end
 
+    # An origin that repeats the credential it was sent, the way a debug
+    # echo or an error page in front of one does. The reflection guard's
+    # tests need the value to come back in a header, in a small body, across
+    # two chunks of a stream, and under a coding that hides it.
+    def call(%{request_path: "/reflect/header"} = conn, _opts) do
+      conn
+      |> put_resp_header("x-debug-authorization", sent_authorization(conn))
+      |> send_resp(200, "ok")
+    end
+
+    def call(%{request_path: "/reflect/body"} = conn, _opts) do
+      send_resp(conn, 200, "you sent: " <> sent_authorization(conn))
+    end
+
+    def call(%{request_path: "/reflect/split"} = conn, _opts) do
+      "Bearer " <> bearer = sent_authorization(conn)
+      {first, second} = String.split_at(bearer, div(byte_size(bearer), 2))
+      conn = conn |> put_resp_content_type("text/event-stream") |> send_chunked(200)
+      {:ok, conn} = chunk(conn, "data: before\n\n")
+      {:ok, conn} = chunk(conn, "data: " <> first)
+      # Long enough that the halves are separate reads at the proxy as well
+      # as separate chunks on the wire.
+      Process.sleep(150)
+      _ = chunk(conn, second <> "\n\n")
+      conn
+    end
+
+    def call(%{request_path: "/reflect/gzip"} = conn, _opts) do
+      conn
+      |> put_resp_header("content-encoding", "gzip")
+      |> send_resp(200, :zlib.gzip("you sent: " <> sent_authorization(conn)))
+    end
+
+    # A long stream that holds no credential, but ends chunks on its first
+    # bytes so the guard has something to hold back and then let go.
+    def call(%{request_path: "/sse"} = conn, _opts) do
+      conn = conn |> put_resp_content_type("text/event-stream") |> send_chunked(200)
+
+      Enum.reduce(Managoat.Broker.ProxyCase.sse_chunks(), conn, fn data, conn ->
+        {:ok, conn} = chunk(conn, data)
+        conn
+      end)
+    end
+
+    # What the origin saw, told to the test rather than echoed at the
+    # client: a protected response that repeats its bearer is refused, so an
+    # echo is no longer a way to look at a protected request.
+    def call(%{request_path: "/report" <> _} = conn, _opts) do
+      [name] = get_req_header(conn, "x-report-to")
+
+      send(String.to_existing_atom(name), {
+        :origin_saw,
+        %{
+          method: conn.method,
+          path: conn.request_path,
+          query: conn.query_string,
+          headers: Map.new(conn.req_headers)
+        }
+      })
+
+      conn |> put_resp_content_type("application/json") |> send_resp(200, ~s({"reported":true}))
+    end
+
     def call(%{request_path: "/ws"} = conn, _opts) do
       conn
       |> WebSockAdapter.upgrade(Managoat.Broker.ProxyCase.Echo, conn.req_headers, timeout: 5_000)
       |> halt()
     end
 
-    def call(conn, _opts) do
+    def call(conn, _opts), do: echo(conn)
+
+    defp sent_authorization(conn), do: conn |> get_req_header("authorization") |> hd()
+
+    defp echo(conn) do
       {:ok, body, conn} = read_body(conn)
 
       conn
@@ -93,6 +160,20 @@ defmodule Managoat.Broker.ProxyCase do
           body: body
         })
       )
+    end
+  end
+
+  @doc """
+  The chunks `/sse` answers with. Several end on the opening bytes of the
+  protected tests' bearer (`managed-secret`), which is the case the
+  reflection guard holds bytes back for.
+  """
+  def sse_chunks do
+    for n <- 1..200 do
+      tail = String.slice("managed-secret", 0, rem(n, 14))
+
+      text = String.duplicate("x", rem(n * 37, 500))
+      ~s(event: delta\ndata: {"n":#{n},"text":"#{text}"}\n\n) <> tail
     end
   end
 
