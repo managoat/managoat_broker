@@ -3,15 +3,30 @@ defmodule Managoat.Broker.HTTPOnly do
   # Opted-in sessions need a gate in front of the response relay, not just
   # an observer after it. Hold bounded heads; stream framed bodies. A bad
   # packet is discarded in full, even if it began with otherwise safe bytes.
-  alias Managoat.Broker.HTTP
+  #
+  # A protected request also queues a `ReflectionGuard` holding the bearer
+  # it was sent with. Its response head is searched before it is released,
+  # a body in a coding the guard cannot read is refused, and the body is
+  # searched as it streams. Responses to other requests carry no guard and
+  # take the path they always did.
+  alias Managoat.Broker.{HTTP, ReflectionGuard}
 
   @max_head 64 * 1024
   @header_name ~r/\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\z/
   @header_controls ~r/[\x00-\x08\x0A-\x1F\x7F]/
-  defstruct pending: [], body: nil, buffer: ""
+  defstruct pending: [], body: nil, buffer: "", guard: nil
 
-  @type t :: %__MODULE__{pending: [binary()], body: term(), buffer: binary()}
-  @type reason :: :upstream_upgrade | :malformed_response
+  @type t :: %__MODULE__{
+          pending: [{binary(), ReflectionGuard.t() | nil}],
+          body: term(),
+          buffer: binary(),
+          guard: ReflectionGuard.t() | nil
+        }
+  @type reason ::
+          :upstream_upgrade
+          | :malformed_response
+          | :credential_reflected
+          | :protected_response_encoded
 
   @spec new(boolean()) :: t() | nil
   def new(false), do: nil
@@ -62,9 +77,20 @@ defmodule Managoat.Broker.HTTPOnly do
     end
   end
 
-  @spec expect(t() | nil, binary()) :: t() | nil
-  def expect(nil, _method), do: nil
-  def expect(state, method), do: %{state | pending: state.pending ++ [method]}
+  @spec expect(t() | nil, binary(), ReflectionGuard.t() | nil) :: t() | nil
+  def expect(state, method, guard \\ nil)
+  def expect(nil, _method, _guard), do: nil
+  def expect(state, method, guard), do: %{state | pending: state.pending ++ [{method, guard}]}
+
+  @doc """
+  The origin closed. Bytes a guard was still holding were the start of
+  nothing, and belong to a body that only the close ends.
+  """
+  @spec closed(t() | nil) :: binary()
+  def closed(%__MODULE__{guard: guard}),
+    do: guard |> ReflectionGuard.flush() |> IO.iodata_to_binary()
+
+  def closed(nil), do: ""
 
   @spec filter(t() | nil, binary()) :: {:ok, t() | nil, binary()} | {:error, reason()}
   def filter(nil, data), do: {:ok, nil, data}
@@ -83,12 +109,20 @@ defmodule Managoat.Broker.HTTPOnly do
   defp step(%{body: body} = state, data, bytes) when not is_nil(body) do
     case HTTP.take_body(body, data) do
       {:done, consumed, rest} ->
-        step(%{state | body: nil}, rest, [consumed | bytes])
+        with {:ok, guard, safe} <- ReflectionGuard.scan(state.guard, consumed) do
+          step(%{state | body: nil, guard: nil}, rest, [
+            [safe | ReflectionGuard.flush(guard)] | bytes
+          ])
+        end
 
       {:partial, consumed, framing} ->
-        if bounded_chunk_line?(framing),
-          do: {:ok, %{state | body: framing}, [consumed | bytes]},
-          else: {:error, :malformed_response}
+        with true <- bounded_chunk_line?(framing),
+             {:ok, guard, safe} <- ReflectionGuard.scan(state.guard, consumed) do
+          {:ok, %{state | body: framing, guard: guard}, [safe | bytes]}
+        else
+          false -> {:error, :malformed_response}
+          {:error, _} = error -> error
+        end
     end
   end
 
@@ -100,7 +134,7 @@ defmodule Managoat.Broker.HTTPOnly do
         length = byte_size(buffer) - byte_size(rest)
 
         if length <= @max_head do
-          accept_head(%{state | buffer: ""}, head, rest, [binary_part(buffer, 0, length) | bytes])
+          accept_head(%{state | buffer: ""}, head, binary_part(buffer, 0, length), rest, bytes)
         else
           {:error, :malformed_response}
         end
@@ -113,18 +147,28 @@ defmodule Managoat.Broker.HTTPOnly do
     end
   end
 
-  defp accept_head(_state, %{status: 101}, _rest, _bytes), do: {:error, :upstream_upgrade}
-  defp accept_head(%{pending: []}, _head, _rest, _bytes), do: {:error, :malformed_response}
+  defp accept_head(_state, %{status: 101}, _raw, _rest, _bytes), do: {:error, :upstream_upgrade}
+  defp accept_head(%{pending: []}, _head, _raw, _rest, _bytes), do: {:error, :malformed_response}
 
-  defp accept_head(state, %{status: status}, rest, bytes) when status in 100..199,
-    do: step(state, rest, bytes)
+  defp accept_head(%{pending: [{method, guard} | pending]} = state, head, raw, rest, bytes) do
+    cond do
+      # Informational heads included: they answer the same request.
+      guard != nil and ReflectionGuard.reflects?(guard, raw) ->
+        {:error, :credential_reflected}
 
-  defp accept_head(%{pending: [method | pending]} = state, head, rest, bytes) do
-    if unambiguous_framing?(head.headers) do
-      framing = HTTP.response_framing(head.status, head.headers, method)
-      step(%{state | pending: pending, body: framing}, rest, bytes)
-    else
-      {:error, :malformed_response}
+      head.status in 100..199 ->
+        step(state, rest, [raw | bytes])
+
+      not unambiguous_framing?(head.headers) ->
+        {:error, :malformed_response}
+
+      guard != nil and ReflectionGuard.encoded?(head.headers) ->
+        {:error, :protected_response_encoded}
+
+      true ->
+        framing = HTTP.response_framing(head.status, head.headers, method)
+        guard = guard && ReflectionGuard.body(guard, framing)
+        step(%{state | pending: pending, body: framing, guard: guard}, rest, [raw | bytes])
     end
   end
 

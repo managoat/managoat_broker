@@ -7,7 +7,17 @@ defmodule Managoat.Broker.ProtectedRule do
   and CONNECT are never allowed. A path
   ending in `/` permits descendants; other paths match exactly. Paths are
   origin-form and reject escapes, dot segments, repeated slashes, backslashes
-  and fragments. Queries are forwarded unchanged, never templated.
+  and fragments.
+
+  ## Queries
+
+  `query` says what a request target's query string does on a protected
+  route. The default, `:refuse`, denies any target holding a `?` (a bare
+  `path?` included) with a `403` and `error: :protected_query`, before the
+  credential is resolved: a route is pinned so the bearer goes to one
+  operation, and a query the sandbox wrote is a parameter to that operation
+  that nobody pinned. `:allow` forwards the query unchanged, never
+  templated, and is for a host that has decided its routes take one.
 
   Set Session.protected to this policy with http_only: true and a non-nil
   authorization reference. No bearer belongs in this struct. The host's
@@ -22,11 +32,62 @@ defmodule Managoat.Broker.ProtectedRule do
   and Content-Length survive. Chunked requests/trailers are refused; streamed
   responses are supported. Hosts must verify this contract against their
   clients and must not let tenant configuration construct or widen policies.
+
+  ## The bearer in a response
+
+  The sandbox never holds the bearer, so a response that repeats it (an
+  origin echoing the request, a CDN error page, a debug endpoint) would be
+  the one way it gets there. Every response to a protected request is
+  therefore searched for the bearer it was sent with, and **refused, not
+  scrubbed**, if it holds it. There is no option to turn this off.
+
+    * The request goes out with `Accept-Encoding: identity`, whatever the
+      client sent and whether or not `allowed_headers` names it. A response
+      that carries any other `Content-Encoding` anyway cannot be searched
+      and is refused (`error: :protected_response_encoded`).
+    * The whole response head is searched before any of it is released.
+    * The body is searched as it streams, decoded from chunked framing, and
+      is never accumulated. Bytes that could be the start of the bearer are
+      held until the next read settles them, so a value split across reads
+      or chunks is caught before its first half is forwarded; at most
+      `byte_size(bearer) - 1` bytes wait, and ordinarily none do. A chunk
+      extension on such a response is refused as malformed.
+    * On a match (`error: :credential_reflected`) nothing more is
+      forwarded and both connections close. Where the sandbox has not been
+      sent any of the response yet it gets a fixed `502` instead. The
+      request event carries the session's `meta`, the route and the rule;
+      a warning is logged with the same. Neither holds the bearer or the
+      bytes that matched.
+
+  What is recognised is the bearer's exact bytes, which any longer string
+  holding it (`Bearer <value>`) contains, and its JSON spelling with `/`
+  written `\\/`. What is **not**: base64, hex, percent-encoding or any other
+  transformation; a truncated or partial copy; a body compressed without
+  saying so; a response on any other request or connection; and any secret
+  other than this bearer.
   """
-  alias Managoat.Broker.{HTTP, HTTPOnly, Injector, ProtectedCredential, Rule, Session}
+  alias Managoat.Broker.{
+    HTTP,
+    HTTPOnly,
+    Injector,
+    ProtectedCredential,
+    ReflectionGuard,
+    Rule,
+    Session
+  }
 
   @enforce_keys [:host, :port, :paths, :methods, :identity, :identity_header, :allowed_headers]
-  defstruct [:name, :host, :port, :paths, :methods, :identity, :identity_header, :allowed_headers]
+  defstruct [
+    :name,
+    :host,
+    :port,
+    :paths,
+    :methods,
+    :identity,
+    :identity_header,
+    :allowed_headers,
+    query: :refuse
+  ]
 
   @type t :: %__MODULE__{
           name: binary() | nil,
@@ -36,7 +97,8 @@ defmodule Managoat.Broker.ProtectedRule do
           methods: [binary()],
           identity: binary(),
           identity_header: binary(),
-          allowed_headers: [binary()]
+          allowed_headers: [binary()],
+          query: :refuse | :allow
         }
   @reserved ~w(authorization host connection proxy-authorization proxy-connection upgrade content-length transfer-encoding trailer te cookie set-cookie forwarded x-forwarded-host x-forwarded-proto x-original-url x-rewrite-url)
   @header ~r/\A[!#$%&'*+.^_`|~0-9a-z-]+\z/
@@ -59,7 +121,8 @@ defmodule Managoat.Broker.ProtectedRule do
       Enum.all?(policy.methods, &(&1 in ~w(GET POST PUT PATCH DELETE HEAD OPTIONS))) and
       safe_identity?(policy.identity) and allowed_header?(policy.identity_header) and
       is_list(policy.allowed_headers) and Enum.all?(policy.allowed_headers, &allowed_header?/1) and
-      (is_nil(policy.name) or is_binary(policy.name))
+      (is_nil(policy.name) or is_binary(policy.name)) and
+      query(policy) in [:refuse, :allow]
   rescue
     _ -> false
   end
@@ -77,11 +140,17 @@ defmodule Managoat.Broker.ProtectedRule do
 
   def select(%Session{protected: policy}, request) do
     if String.downcase(request.host) == policy.host do
-      if request.scheme == :https and request.port == policy.port and
-           request.method in policy.methods and
-           allowed_target?(policy, request.target),
-         do: {:ok, policy},
-         else: {:error, :protected_destination}
+      cond do
+        not (request.scheme == :https and request.port == policy.port and
+               request.method in policy.methods and allowed_target?(policy, request.target)) ->
+          {:error, :protected_destination}
+
+        query(policy) != :allow and String.contains?(request.target, "?") ->
+          {:error, :protected_query}
+
+        true ->
+          {:ok, policy}
+      end
     else
       :ordinary
     end
@@ -101,10 +170,14 @@ defmodule Managoat.Broker.ProtectedRule do
         kept = Enum.filter(headers, fn {key, _} -> String.downcase(key) in allowed end)
         # These are never delegated to tenant headers, even if mistakenly
         # named in the ordinary allowlist.
+        # Nor is the response's coding: a compressed body cannot be searched
+        # for the bearer, so the proxy asks for none on the client's behalf.
         kept =
-          Enum.reject(kept, fn {key, _} -> String.downcase(key) == policy.identity_header end)
+          Enum.reject(kept, fn {key, _} ->
+            String.downcase(key) in [policy.identity_header, "accept-encoding"]
+          end)
 
-        {:ok, [{"host", authority(policy)} | kept]}
+        {:ok, [{"host", authority(policy)}, {"accept-encoding", "identity"} | kept]}
     end
   end
 
@@ -123,6 +196,22 @@ defmodule Managoat.Broker.ProtectedRule do
       {:error, :authorization_unavailable}
     end
   end
+
+  @doc false
+  # What the response to this request is searched for: nothing, unless the
+  # rule that applied was a protected one, and then the bearer `inject/4`
+  # just wrote. Read back off the outgoing head so that the value searched
+  # for is the value sent.
+  def response_secrets(%__MODULE__{}, headers) do
+    "Bearer " <> bearer = HTTP.header(headers, "authorization")
+    ReflectionGuard.needles(bearer)
+  end
+
+  def response_secrets(_rule, _headers), do: nil
+
+  # A policy persisted by a release that had no `query` key has none, and
+  # reads as the default rather than as an invalid session.
+  defp query(policy), do: Map.get(policy, :query, :refuse)
 
   defp conflicting?(%Rule{scheme: :passthrough}, _request), do: false
 

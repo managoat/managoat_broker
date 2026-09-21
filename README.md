@@ -273,7 +273,9 @@ defaults in the library:
     methods: ["GET", "POST"],
     identity: "account-123",
     identity_header: "x-account-id",
-    allowed_headers: ["content-type", "accept"]
+    allowed_headers: ["content-type", "accept"],
+    # The default. `:allow` forwards a query string under the bearer.
+    query: :refuse
   },
   rules: ordinary_rules
 }
@@ -295,7 +297,15 @@ The proxy enforces the policy independently of what ordinary rules say:
 - Protected requests use the exact HTTPS host/port and approved HTTP methods.
   TRACE and CONNECT are never permitted. Paths match exactly; a trailing slash
   explicitly permits that subtree. Encoded/ambiguous paths, dot segments,
-  backslashes and fragments are denied. Queries pass through unchanged.
+  backslashes and fragments are denied.
+- A query string on a protected route is **refused by default**
+  (`query: :refuse`): any target holding a `?`, a bare `path?` included, is a
+  `403` with `error: :protected_query`, decided before the credential is
+  resolved, so nothing is injected and nothing reaches the origin. A route is
+  pinned so that the bearer reaches one operation; a query the sandbox wrote
+  is a parameter to that operation which nobody pinned. A host whose routes
+  do take a query sets `query: :allow`, and it is then forwarded unchanged,
+  never templated.
 - A matching ordinary injection rule is a conflict (403) before credential
   resolution; passthrough rules are harmless. Rules for other destinations
   still work. That ordinary path receives no protected credential, and a
@@ -314,12 +324,69 @@ The proxy enforces the policy independently of what ordinary rules say:
   client's request to the redirected destination gets a separate decision
   and cannot carry the injected bearer through the ordinary rule path.
 
+#### The bearer in a response
+
+The sandbox never holds the bearer, so the one way left for it to get there is
+for a response to repeat it: an origin that echoes the request, an error page
+from whatever sits in front of it, a debug endpoint. Only the proxy knows the
+value at that moment, so only the proxy can look. **Every response to a
+protected request is searched for the bearer that request was sent with, and
+refused if it holds it.** This is on for every protected rule and there is no
+option to turn it off. Responses to every other request are not searched and
+take the path they always did.
+
+It refuses rather than scrubs. Rewriting a framed stream means re-framing it (a
+`Content-Length` that is no longer true, chunk sizes to recompute), and a
+scrubber that misses one spelling still ships the rest of a response the origin
+should never have produced. A cut connection is a failure an agent already
+handles.
+
+- **The request asks for no coding.** A protected request goes upstream with
+  `Accept-Encoding: identity`, whatever the client sent and whether or not
+  `allowed_headers` names the header, because a compressed body cannot be
+  searched. A response that arrives with any other `Content-Encoding` anyway
+  is refused unread (`error: :protected_response_encoded`).
+- **The head** is searched whole, status line and every header, before any of
+  it is released. Informational (`1xx`) heads are searched too.
+- **The body** is searched as it streams and is never accumulated. It is
+  searched *decoded*: chunk framing is stepped over, so a chunk boundary in
+  the middle of the value does not hide it, and trailers are searched like
+  body. Bytes are released only once they cannot be the start of the value:
+  the longest suffix in hand that is a proper prefix of the bearer waits for
+  the next read, so a value split across reads or chunks is caught *before*
+  its first half is forwarded. Ordinarily that suffix is empty and nothing
+  waits; at most `byte_size(bearer) - 1` bytes ever do, and they are released
+  when the body ends or the origin closes. A chunk extension on a searched
+  response is refused as `:malformed_response` rather than searched.
+- **On a match** (`error: :credential_reflected`) nothing more is forwarded,
+  the packet that held the value is dropped whole, and both connections close.
+  If the sandbox had been sent none of that response yet (the value was in the
+  head, or in a body that arrived with its head) it gets a fixed `502` with a
+  fixed body instead; mid-stream there is no status left to send, so the
+  stream is cut. The request event carries `error`, the route (`method`,
+  `host`, `path`), the `rule` and the session's `meta`, with `status: 502`
+  where that was sent and the origin's status where the body had begun. A
+  warning is logged with the same fields. Neither carries the bearer or the
+  bytes that matched.
+
+What is recognised is the bearer's **exact bytes**, which any longer string
+holding it (`Bearer <value>`, a JSON document quoting it) contains, plus its
+JSON spelling with `/` written `\/`. What is **not** recognised: base64, hex,
+percent-encoding or any other transformation of the value; a truncated or
+partial copy; a body that is compressed or encoded without a
+`Content-Encoding` saying so; a copy in the response to some *other* request
+or on another connection; and any secret other than this bearer (an ordinary
+rule's credential is not searched for). It narrows what an accidental echo can
+do. It is not a defence against an origin that sets out to exfiltrate.
+
 `ProtectedRule.valid_session?/1` checks persisted policy without credentials.
 Invalid policies, missing authorization references, or disabled HTTP-only mode
 are rejected at initial lookup. The rule supplies CONNECT reachability under
 `:deny`, but the HTTP request still needs fresh authorization. Protected
-request events use `scheme: :protected_bearer`; `:protected_destination` and
-`:protected_conflict` identify policy refusals without secret payloads.
+request events use `scheme: :protected_bearer`; `:protected_destination`,
+`:protected_query` and `:protected_conflict` identify policy refusals, and
+`:credential_reflected` and `:protected_response_encoded` a refused response,
+all without secret payloads.
 
 The host must still enforce write-time policy ownership, prevent reserved
 credential aliases in its compiler, fence issuance/updates with revocation,
@@ -457,8 +524,10 @@ over rather than when it starts.
   status the proxy sent (`403`).
 - `error` is nil when the request completed. Otherwise it is one of
   `:upstream_send_failed`, `:upstream_read_failed`, `:malformed_response`,
-  `:upstream_closed` or `:client_closed`. A response whose head arrived and
-  whose body then failed carries both its `status` and its `error`.
+  `:upstream_closed` or `:client_closed`; or, for a protected request,
+  `:credential_reflected` or `:protected_response_encoded` (see "The bearer
+  in a response"). A response whose head arrived and whose body then failed
+  carries both its `status` and its `error`.
 
 A consequence worth planning for: **a long-lived request is not recorded
 until it ends**, so a streaming reply appears in a host's audit log when
