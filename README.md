@@ -144,9 +144,9 @@ the agent doing anything wrong, and `502` is what tells it to retry once
 the credential is provisioned. `403` would say it is not allowed, which is
 a different and misleading thing. Inside a tunnel the request is refused
 without ending the tunnel, unless the refused request left a body behind it
-in the stream. `:substitute` and an unfilled `{{ KEY }}` are the exceptions
-described above: a placeholder the origin can see is the clearer failure
-there.
+in the stream or an earlier response is still being relayed. `:substitute`
+and an unfilled `{{ KEY }}` are the exceptions described above: a
+placeholder the origin can see is the clearer failure there.
 
 A placeholder must be distinctive enough to be one: four characters or
 more, holding a letter or digit, and carrying a boundary — `__` at either
@@ -197,8 +197,11 @@ an authorization failure.
 Denied authority (including a locally expired opted-in session) returns
 **403** with `error: :authorization_denied`. Unavailable authority, a missing
 callback, an exception/exit/throw or a malformed result returns **503** with
-`error: :authorization_unavailable`. Both close the client connection;
-callback payloads and exception messages are neither logged nor returned.
+`error: :authorization_unavailable`. On the absolute-form path both close
+the client connection; inside a tunnel a bodyless 403 keeps the tunnel (see
+"Connections, and who decides them") and the next request is authorized
+again, while a 503 closes it. Callback payloads and exception messages are
+neither logged nor returned.
 A missing grant or session must be denied by the host, even if its initial
 lookup succeeded on a different node before revocation.
 
@@ -226,7 +229,8 @@ matches or what its authorization callback returns.
   token, and a nested CONNECT inside the intercepted tunnel. Check before
   credential resolution, then check the effective headers after templates
   and substitution. Refusals return 403 with `error: :protocol_upgrade`
-  and close; no rejected request is forwarded to the origin. Invalid
+  and close, even inside a tunnel where other bodyless denials keep it; no
+  rejected request is forwarded to the origin. Invalid
   header names and value control characters also return 403 with
   `error: :unsafe_request`, so a template cannot manufacture hidden wire
   headers with a newline in an unrelated value. Reject ambiguous request
@@ -306,6 +310,33 @@ The proxy enforces the policy independently of what ordinary rules say:
   is a parameter to that operation which nobody pinned. A host whose routes
   do take a query sets `query: :allow`, and it is then forwarded unchanged,
   never templated.
+- **Per-route policy.** `paths`, `methods` and `query` hold jointly: every
+  method and the query policy apply on every path. Where one route must be
+  narrower than another under the same bearer, set `routes` instead, and
+  leave `paths` and `methods` unset:
+
+  ```elixir
+  routes: [
+    %{path: "/backend-api/codex/responses", methods: ["POST"], query: :refuse},
+    %{path: "/backend-api/codex/models", methods: ["GET"],
+      query: {:only, ["client_version"]}}
+  ]
+  ```
+
+  A request is admitted when one route matches its path, its method and its
+  query; overlapping routes are a union. A route's `query` defaults to
+  `:refuse`. `{:only, names}` admits a query only when it is `name=value`
+  pairs whose every name is one of `names`, each at most once, compared as
+  raw bytes (no percent-encoded or otherwise respelled name matches), with
+  values limited to unreserved characters, well-formed `%XX` escapes and
+  `+ , : @ ! $ ' ( ) * /`, and never decoding to a control character. `;`,
+  a repeated name, an empty pair and a bare `path?` are refused. An admitted
+  query is forwarded byte for byte. A pinned name set gives the sandbox the
+  values of parameters the host chose, which is what it already writes in
+  the body, rather than any parameter the origin understands; pin only
+  parameters whose every value is harmless. A policy with `routes` must not
+  also set `paths`, `methods` or a non-default `query`, and one without
+  `routes` (including one persisted by 0.15) behaves exactly as before.
 - A matching ordinary injection rule is a conflict (403) before credential
   resolution; passthrough rules are harmless. Rules for other destinations
   still work. That ordinary path receives no protected credential, and a
@@ -417,6 +448,19 @@ refusal.
 
 `CONNECT` tunnels keep alive too. Rule processing, and authorization for
 opted-in sessions, run for each HTTP request inside the tunnel.
+
+A refusal inside a tunnel refuses the request, not the tunnel. A `403` (a
+denial: `deny` policy, a protected route or query, denied authority, a
+conflict) or a `502` (`:credential_missing`) is answered without
+`connection: close` and the tunnel goes on to the next request, which is
+decided afresh — so a client refused one route of a host can reach an
+allowed route of it without a new TCP and TLS connection. The tunnel still
+closes when the refused request carried a body (the proxy does not read a
+body it is refusing, so the next request could not be found in the stream),
+when an earlier response on the tunnel is still being relayed (the proxy's
+own reply would otherwise land inside it), on a `503`, and on the HTTP-only
+refusals of a request's own shape (`:protocol_upgrade`, `:unsafe_request`).
+Absolute-form plain HTTP still closes on any refusal, as above.
 
 ## The child spec
 

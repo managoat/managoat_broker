@@ -126,6 +126,223 @@ defmodule Managoat.Broker.ProtectedRuleTest do
              ProtectedRule.select(session(legacy), request("/responses?x=1"))
   end
 
+  describe "routes" do
+    defp routed do
+      %ProtectedRule{
+        host: "provider.example",
+        port: 443,
+        identity: "acct-1",
+        identity_header: "x-account-id",
+        allowed_headers: ["content-type"],
+        routes: [
+          %{path: "/codex/responses", methods: ["POST"], query: :refuse},
+          %{path: "/codex/models", methods: ["GET"], query: {:only, ["client_version"]}}
+        ]
+      }
+    end
+
+    defp get(target), do: %{request(target) | method: "GET"}
+
+    test "each route admits its own method and query and nothing of the other's" do
+      policy = routed()
+      assert ProtectedRule.valid_session?(session(policy))
+
+      assert {:ok, ^policy} = ProtectedRule.select(session(policy), request("/codex/responses"))
+
+      for target <- ["/codex/models", "/codex/models?client_version=0.44.0"] do
+        assert {:ok, ^policy} = ProtectedRule.select(session(policy), get(target))
+      end
+
+      # The other route's method is not this route's.
+      assert {:error, :protected_destination} =
+               ProtectedRule.select(session(policy), request("/codex/models"))
+
+      assert {:error, :protected_destination} =
+               ProtectedRule.select(session(policy), get("/codex/responses"))
+
+      # Nor is the other route's query policy.
+      assert {:error, :protected_query} =
+               ProtectedRule.select(
+                 session(policy),
+                 request("/codex/responses?client_version=1")
+               )
+
+      assert {:error, :protected_destination} =
+               ProtectedRule.select(session(policy), get("/codex/models/extra"))
+    end
+
+    test "a pinned query admits only its names, once each, spelled plainly" do
+      policy = routed()
+
+      for query <- [
+            "client_version=0.44.0",
+            "client_version=",
+            "client_version=a%2Fb+c",
+            "client_version=1.2.3-alpha+build:x@y!$'()*,/"
+          ] do
+        assert {:ok, _} = ProtectedRule.select(session(policy), get("/codex/models?" <> query)),
+               query
+      end
+
+      for query <- [
+            # Unpinned, extra, or repeated names.
+            "model=x",
+            "client_version=1&model=x",
+            "model=x&client_version=1",
+            "client_version=1&client_version=2",
+            # Another spelling of the pinned name.
+            "Client_Version=1",
+            "client%5Fversion=1",
+            "client_version%3D=1",
+            "client+version=1",
+            " client_version=1",
+            # Malformed: empty, empty pair, no `=`, a second `=`.
+            "",
+            "&client_version=1",
+            "client_version=1&",
+            "client_version",
+            "client_version=1=2",
+            # Separators and characters an origin may read differently.
+            "client_version=1;model=x",
+            "client_version=1?model=x",
+            "client_version=1#frag",
+            "client_version=%",
+            "client_version=%zz",
+            "client_version=%4",
+            # Values that decode to control characters.
+            "client_version=%00",
+            "client_version=a%0d%0aX-Injected:%201",
+            "client_version=%7F"
+          ] do
+        assert {:error, :protected_query} =
+                 ProtectedRule.select(session(policy), get("/codex/models?" <> query)),
+               inspect(query)
+      end
+    end
+
+    test "overlapping routes are a union, and a route without a query key refuses one" do
+      policy = %{
+        routed()
+        | routes: [
+            %{path: "/api/", methods: ["GET"]},
+            %{path: "/api/search", methods: ["GET"], query: :allow}
+          ]
+      }
+
+      assert ProtectedRule.valid_session?(session(policy))
+      assert {:ok, _} = ProtectedRule.select(session(policy), get("/api/search?q=anything"))
+      assert {:ok, _} = ProtectedRule.select(session(policy), get("/api/other"))
+
+      assert {:error, :protected_query} =
+               ProtectedRule.select(session(policy), get("/api/other?q=1"))
+    end
+
+    test "scheme, port and host still gate every route" do
+      policy = routed()
+      target = "/codex/models?client_version=1"
+
+      assert {:error, :protected_destination} =
+               ProtectedRule.select(session(policy), %{get(target) | scheme: :http})
+
+      assert {:error, :protected_destination} =
+               ProtectedRule.select(session(policy), %{get(target) | port: 8443})
+
+      assert :ordinary =
+               ProtectedRule.select(session(policy), %{get(target) | host: "other.example"})
+    end
+
+    test "malformed routes, and a policy written both ways, are invalid" do
+      policy = routed()
+      [responses, models] = policy.routes
+
+      for routes <- [
+            [],
+            :all,
+            [%{}],
+            [%{path: "/codex/models"}],
+            [%{methods: ["GET"]}],
+            [%{responses | path: "codex"}],
+            [%{responses | path: "/codex/../x"}],
+            [%{responses | path: "/x%2fy"}],
+            [%{responses | path: "/x?y"}],
+            [%{responses | methods: []}],
+            [%{responses | methods: ["TRACE"]}],
+            [%{responses | methods: ["CONNECT"]}],
+            [%{responses | methods: "POST"}],
+            [%{responses | query: nil}],
+            [%{responses | query: :forward}],
+            [%{models | query: {:only, []}}],
+            [%{models | query: {:only, "client_version"}}],
+            [%{models | query: {:only, ["client_version", "client_version"]}}],
+            [%{models | query: {:only, ["client version"]}}],
+            [%{models | query: {:only, ["a%62"]}}],
+            [%{models | query: {:only, ["a=b"]}}],
+            [%{models | query: {:only, ["a&b"]}}],
+            [%{models | query: {:only, [:client_version]}}],
+            [%{models | query: {:only, [""]}}],
+            [%{models | query: {:except, ["x"]}}],
+            [Map.put(responses, :method, "GET")],
+            [{"/codex/responses", ["POST"]}],
+            [responses, nil]
+          ] do
+        refute ProtectedRule.valid_session?(session(%{policy | routes: routes})), inspect(routes)
+      end
+
+      # `routes` replaces the joint fields; setting both is refused rather
+      # than resolved in favour of either.
+      for change <- [
+            paths: ["/codex/responses"],
+            methods: ["GET"],
+            query: :allow
+          ] do
+        refute ProtectedRule.valid_session?(session(struct!(policy, [change]))), inspect(change)
+      end
+
+      assert ProtectedRule.valid_session?(session(%{policy | paths: [], methods: []}))
+
+      # `{:only, _}` belongs to a route; the joint `query` does not take it.
+      refute ProtectedRule.valid_session?(
+               session(%{policy() | query: {:only, ["client_version"]}})
+             )
+
+      # And without routes, the joint fields are still required.
+      refute ProtectedRule.valid_session?(session(%{policy() | paths: nil}))
+      refute ProtectedRule.valid_session?(session(%{policy() | methods: nil}))
+    end
+
+    test "a policy persisted before routes existed reads as one without them" do
+      legacy = policy() |> Map.delete(:routes) |> Map.delete(:query)
+      assert ProtectedRule.valid_session?(session(legacy))
+      assert {:ok, _} = ProtectedRule.select(session(legacy), request("/responses"))
+      assert {:ok, _} = ProtectedRule.select(session(legacy), get("/api/x"))
+
+      assert {:error, :protected_query} =
+               ProtectedRule.select(session(legacy), request("/responses?client_version=1"))
+
+      assert {:error, :protected_destination} =
+               ProtectedRule.select(session(legacy), %{request("/responses") | method: "PUT"})
+    end
+
+    test "an ordinary injection rule overlapping any route conflicts" do
+      policy = routed()
+      ordinary = %Rule{pattern: "provider.example/codex/models", scheme: :bearer, credential: "x"}
+      session = %{session(policy) | rules: [ordinary]}
+
+      assert {:error, :protected_conflict} =
+               ProtectedRule.prepare(policy, session, get("/codex/models?client_version=1"), [])
+
+      # The rule's path does not reach the other route.
+      assert {:ok, _} = ProtectedRule.prepare(policy, session, request("/codex/responses"), [])
+
+      host_wide = %{ordinary | pattern: "provider.example"}
+
+      for req <- [request("/codex/responses"), get("/codex/models?client_version=1")] do
+        assert {:error, :protected_conflict} =
+                 ProtectedRule.prepare(policy, %{session | rules: [host_wide]}, req, [])
+      end
+    end
+  end
+
   test "an allowlisted Accept-Encoding is still replaced with identity" do
     policy = %{policy() | allowed_headers: ["accept-encoding"]}
 

@@ -170,6 +170,57 @@ defmodule Managoat.Broker.ProtectedProxyTest do
     refute_received {:authorize, _}
   end
 
+  describe "a protected destination refused inside a tunnel" do
+    # The managed route shares its host with routes the session is refused,
+    # and a client keeps asking for those. Each refusal used to close the
+    # tunnel (managoat/fountain#2503).
+    test "keeps a bodyless request's tunnel, and the protected route still injects", ctx do
+      tls = tunnel(ctx, ctx.token)
+      on_exit(fn -> :ssl.close(tls) end)
+
+      for path <- ["/other", "/allowed/suffix", "/report?x=1"] do
+        :ok = :ssl.send(tls, raw(path))
+        reply = recv_until(tls, "\r\n\r\n")
+        assert reply =~ "HTTP/1.1 403 Forbidden"
+        refute reply =~ "connection: close"
+      end
+
+      refute_received {:authorize, %{protected: true}}
+
+      {_, %{"reported" => true}} = request(tls, raw("/report"))
+      assert_receive {:origin_saw, %{headers: %{"authorization" => "Bearer managed-secret"}}}
+      assert_receive {:authorize, %{protected: true, target: "/report"}}
+
+      assert_receive {:request, %{count: 1},
+                      %{path: "/other", status: 403, error: :protected_destination}}
+
+      assert_receive {:request, _, %{path: "/allowed/suffix", status: 403}}
+      assert_receive {:request, _, %{path: "/report", status: 403, error: :protected_query}}
+
+      assert_receive {:request, _,
+                      %{path: "/report", status: 200, error: nil, scheme: :protected_bearer}}
+
+      refute_receive {:request, _, %{path: "/other"}}, 200
+    end
+
+    test "still closes when the refused request carried a body", ctx do
+      tls = tunnel(ctx, ctx.token)
+
+      :ok =
+        :ssl.send(
+          tls,
+          "POST /other HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody"
+        )
+
+      reply = recv_until(tls, "\r\n\r\n")
+      assert reply =~ "HTTP/1.1 403"
+      assert reply =~ "connection: close"
+      assert {:error, :closed} = :ssl.recv(tls, 0, 2_000)
+      assert_receive {:request, _, %{path: "/other", status: 403, error: :protected_destination}}
+      refute_receive {:request, _, %{path: "/other"}}, 200
+    end
+  end
+
   test "unapproved HTTP methods cannot resolve a credential", ctx do
     tls = tunnel(ctx, ctx.token)
     :ssl.send(tls, "TRACE /allowed HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -389,6 +440,133 @@ defmodule Managoat.Broker.ProtectedProxyTest do
     end
   end
 
+  describe "per-route policy" do
+    # Two routes under one bearer, shaped like the Codex pair: a POST that
+    # takes no query, and a GET that takes one pinned parameter.
+    setup ctx do
+      policy = %{
+        ctx.policy
+        | paths: nil,
+          methods: nil,
+          routes: [
+            %{path: "/report", methods: ["POST"], query: :refuse},
+            %{path: "/report/models", methods: ["GET"], query: {:only, ["client_version"]}},
+            %{path: "/reflect/", methods: ["GET"], query: {:only, ["client_version"]}}
+          ]
+      }
+
+      Memory.put(ctx.store, ctx.token, %{ctx.session | protected: policy})
+      %{routed: policy}
+    end
+
+    test "the narrow route admits its pinned parameter under the bearer", ctx do
+      tls = tunnel(ctx, ctx.token)
+
+      {_, %{"reported" => true}} =
+        request(
+          tls,
+          raw(
+            "/report/models?client_version=0.44.0",
+            "Authorization: fake\r\nX-Account-ID: another\r\nCookie: a=b\r\nAccept-Encoding: gzip\r\n"
+          )
+        )
+
+      assert_receive {:origin_saw,
+                      %{method: "GET", path: "/report/models", query: "client_version=0.44.0"} =
+                        saw}
+
+      assert saw.headers["authorization"] == "Bearer managed-secret"
+      assert saw.headers["x-account-id"] == "account-1"
+      assert saw.headers["accept-encoding"] == "identity"
+      refute Map.has_key?(saw.headers, "cookie")
+
+      assert_receive {:authorize,
+                      %{protected: true, target: "/report/models?client_version=0.44.0"}}
+
+      assert_receive {:request, _,
+                      %{
+                        status: 200,
+                        rule: "managed",
+                        scheme: :protected_bearer,
+                        path: "/report/models"
+                      }}
+
+      # The same tunnel carries the wide route next, under its own policy.
+      {_, %{"reported" => true}} = request(tls, post("/report"))
+      assert_receive {:origin_saw, %{method: "POST", path: "/report", query: ""} = saw}
+      assert saw.headers["authorization"] == "Bearer managed-secret"
+      :ssl.close(tls)
+    end
+
+    test "another parameter, another route's method or a query off the list is refused", ctx do
+      refusals = [
+        {raw("/report/models?model=x"), :protected_query},
+        {raw("/report/models?client_version=1&model=x"), :protected_query},
+        {raw("/report/models?client_version=1&client_version=2"), :protected_query},
+        {raw("/report/models?client_version=%0d%0a"), :protected_query},
+        {post("/report?client_version=1"), :protected_query},
+        {post("/report/models"), :protected_destination},
+        {raw("/report"), :protected_destination},
+        {raw("/report/other"), :protected_destination}
+      ]
+
+      for {head, error} <- refusals do
+        tls = tunnel(ctx, ctx.token)
+        :ssl.send(tls, head)
+        assert recv_until(tls, "\r\n\r\n") =~ "HTTP/1.1 403", head
+        assert_receive {:request, _, %{status: 403, error: ^error, outcome: :denied}}
+        :ssl.close(tls)
+      end
+
+      refute_received {:authorize, _}
+      refute_received {:origin_saw, _}
+    end
+
+    test "an ordinary rule on either route conflicts before the bearer is resolved", ctx do
+      rule = %Rule{pattern: "localhost/report/models", scheme: :bearer, credential: "ordinary"}
+      Agent.update(ctx.state, &%{&1 | rules: [rule]})
+
+      Memory.put(ctx.store, ctx.token, %{
+        ctx.session
+        | protected: ctx.routed,
+          rules: [rule]
+      })
+
+      tls = tunnel(ctx, ctx.token)
+      :ssl.send(tls, raw("/report/models?client_version=1"))
+      assert recv_until(tls, "\r\n\r\n") =~ "HTTP/1.1 403"
+      assert_receive {:request, _, %{error: :protected_conflict}}
+      refute_received {:authorize, %{protected: true}}
+      refute_received {:origin_saw, _}
+      :ssl.close(tls)
+    end
+
+    test "a response on a routed request is still searched for the bearer", ctx do
+      tls = tunnel(ctx, ctx.token)
+      :ssl.send(tls, raw("/reflect/body?client_version=1"))
+      response = read_until_tls_closed(tls)
+      assert response =~ "HTTP/1.1 502 Bad Gateway"
+      refute response =~ "managed-secret"
+      assert_receive {:request, _, %{error: :credential_reflected, rule: "managed"}}
+    end
+
+    test "an upgrade on a routed request is refused before the bearer is resolved", ctx do
+      tls = tunnel(ctx, ctx.token)
+      :ssl.send(tls, raw("/report/models?client_version=1", "Upgrade: websocket\r\n"))
+      assert recv_until(tls, "\r\n\r\n") =~ "HTTP/1.1 403"
+      refute_received {:authorize, _}
+      :ssl.close(tls)
+    end
+
+    test "a malformed route is refused before a tunnel opens", ctx do
+      broken = %{ctx.routed | routes: [%{path: "/report", methods: ["TRACE"]}]}
+      Memory.put(ctx.store, ctx.token, %{ctx.session | protected: broken})
+      {tcp, response} = connect(ctx, "localhost:#{ctx.https_port}", proxy_auth(ctx.token))
+      assert response =~ "407"
+      :gen_tcp.close(tcp)
+    end
+  end
+
   describe "a protected response that repeats its bearer" do
     test "in a header is answered with a fixed 502, and says so without saying what", ctx do
       tls = tunnel(ctx, ctx.token)
@@ -578,14 +756,27 @@ defmodule Managoat.Broker.ProtectedProxyTest do
 
   defp failure(kind), do: {kind, "secret-in-error"}
 
+  # A bodyless `403` keeps its tunnel, so the next request on it is decided
+  # afresh; a `503` still closes it.
   defp assert_refused(tls, path, status) do
     :ssl.send(tls, raw(path))
-    assert recv_until(tls, "\r\n\r\n") =~ "HTTP/1.1 #{status}"
-    assert {:error, :closed} = :ssl.recv(tls, 0, 2_000)
+    reply = recv_until(tls, "\r\n\r\n")
+    assert reply =~ "HTTP/1.1 #{status}"
+
+    if status == 403 do
+      refute reply =~ "connection: close"
+      assert {:error, :timeout} = :ssl.recv(tls, 0, 100)
+    else
+      assert {:error, :closed} = :ssl.recv(tls, 0, 2_000)
+    end
   end
 
   defp raw(path, headers \\ ""),
     do: "GET #{path} HTTP/1.1\r\nHost: localhost\r\nX-Report-To: #{@observer}\r\n#{headers}\r\n"
+
+  defp post(path),
+    do:
+      "POST #{path} HTTP/1.1\r\nHost: localhost\r\nX-Report-To: #{@observer}\r\nContent-Length: 0\r\n\r\n"
 
   defp plain(ctx, host, port),
     do:
