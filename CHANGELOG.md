@@ -10,6 +10,12 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-26
+
+Per-route protected policy, and a kept tunnel on a bodyless denial. Nothing
+changes for a policy without `routes`. A client that relied on a `403`
+closing its tunnel sees the tunnel stay open; see "Changed".
+
 ### Added
 
 - **`ProtectedRule.routes`: per-route method and query policy.** A list of
