@@ -3,7 +3,9 @@ defmodule Managoat.Broker.ProtectedRule do
   Server-controlled policy for one non-exportable bearer per session.
 
   The host supplies an exact lowercase host, port, paths, public identity
-  and its header name, allowed HTTP methods, and an allowlist of ordinary request headers. TRACE
+  and its header name, allowed HTTP methods (or, in place of paths and
+  methods, per-route `routes`; see "Routes"), and an allowlist of ordinary
+  request headers. TRACE
   and CONNECT are never allowed. A path
   ending in `/` permits descendants; other paths match exactly. Paths are
   origin-form and reject escapes, dot segments, repeated slashes, backslashes
@@ -18,6 +20,60 @@ defmodule Managoat.Broker.ProtectedRule do
   operation, and a query the sandbox wrote is a parameter to that operation
   that nobody pinned. `:allow` forwards the query unchanged, never
   templated, and is for a host that has decided its routes take one.
+
+  `{:only, names}` is the narrow middle, and is available only on a route in
+  `routes` (below). A query is admitted when every parameter's name is one of
+  `names`, and is then forwarded byte for byte. Anything else is
+  `:protected_query`. Names are compared as the raw bytes on the wire, so no
+  spelling of a name can mean one thing here and another to the origin:
+
+    * the query is `name=value` pairs joined by `&`, each with a `=`; an
+      empty query (`path?`), an empty pair (`a=1&&b=2`, a trailing `&`) or a
+      pair without `=` is malformed and refused;
+    * a name must equal a pinned name exactly, case included; a name holding
+      `%`, `+` or anything else outside the pinned characters cannot;
+    * each pinned name may appear at most once, because origins disagree
+      about which of two copies wins;
+    * a value is unreserved characters, `%XX` escapes and
+      `+ , : @ ! $ ' ( ) * /`; `;` (a separator to some servers), `=`, `?`,
+      `#` and a malformed escape are refused, as is a value that decodes to
+      a control character.
+
+  Why a pinned name set is acceptable where a free query was not: what a
+  free query admits is an operation nobody chose, since every parameter the
+  origin understands becomes reachable under the bearer. A pinned name set
+  puts the choice of parameters back with the host, and leaves the sandbox
+  only their values, which is what it already controls on the same route in
+  the body. The values are still the sandbox's: the host should pin only
+  parameters whose every value is harmless on that route. The bearer is never
+  put into a query by the broker, and the response is searched for it
+  whatever the query was (below).
+
+  ## Routes
+
+  `paths`, `methods` and `query` apply jointly: every method and the query
+  policy hold on every path. A host that needs a narrower policy on one path
+  than on another sets `routes` instead, a list of maps:
+
+      routes: [
+        %{path: "/backend-api/codex/responses", methods: ["POST"], query: :refuse},
+        %{path: "/backend-api/codex/models", methods: ["GET"],
+          query: {:only, ["client_version"]}}
+      ]
+
+  A request is admitted when one route matches its path (with the same
+  exact/subtree rule as `paths`), its method, and its query. A request that
+  matches no route's path and method is `:protected_destination`; one that
+  does, but whose query none of those routes admits, is `:protected_query`.
+  Overlapping routes are a union. `query` is optional in a route and
+  defaults to `:refuse`; a route with any other key is invalid.
+
+  `routes` replaces the joint fields rather than adding to them. A policy
+  that sets `routes` must leave `paths` and `methods` `nil` (or `[]`) and
+  `query` at its default, so that a policy written half one way and half
+  the other is refused by `valid_session?/1` rather than read as whichever
+  half wins. A policy with no `routes` (including one persisted before the
+  key existed) behaves exactly as before.
 
   Set Session.protected to this policy with http_only: true and a non-nil
   authorization reference. No bearer belongs in this struct. The host's
@@ -76,7 +132,7 @@ defmodule Managoat.Broker.ProtectedRule do
     Session
   }
 
-  @enforce_keys [:host, :port, :paths, :methods, :identity, :identity_header, :allowed_headers]
+  @enforce_keys [:host, :port, :identity, :identity_header, :allowed_headers]
   defstruct [
     :name,
     :host,
@@ -86,23 +142,38 @@ defmodule Managoat.Broker.ProtectedRule do
     :identity,
     :identity_header,
     :allowed_headers,
-    query: :refuse
+    query: :refuse,
+    routes: nil
   ]
+
+  @typedoc "What a query string may do on a route. `{:only, _}` is for `routes` only."
+  @type query_policy :: :refuse | :allow | {:only, [binary(), ...]}
+
+  @typedoc "One protected route: a path, its methods, and its query policy."
+  @type route :: %{
+          required(:path) => binary(),
+          required(:methods) => [binary(), ...],
+          optional(:query) => query_policy()
+        }
 
   @type t :: %__MODULE__{
           name: binary() | nil,
           host: binary(),
           port: :inet.port_number(),
-          paths: [binary()],
-          methods: [binary()],
+          paths: [binary()] | nil,
+          methods: [binary()] | nil,
           identity: binary(),
           identity_header: binary(),
           allowed_headers: [binary()],
-          query: :refuse | :allow
+          query: :refuse | :allow,
+          routes: [route(), ...] | nil
         }
   @reserved ~w(authorization host connection proxy-authorization proxy-connection upgrade content-length transfer-encoding trailer te cookie set-cookie forwarded x-forwarded-host x-forwarded-proto x-original-url x-rewrite-url)
   @header ~r/\A[!#$%&'*+.^_`|~0-9a-z-]+\z/
   @bearer ~r/\A[A-Za-z0-9._~+\/-]+=*\z/
+  @methods ~w(GET POST PUT PATCH DELETE HEAD OPTIONS)
+  @param_name ~r/\A[A-Za-z0-9._~-]+\z/
+  @param_value ~r/\A(?:[A-Za-z0-9._~+,:@!$'()*\/-]|%[0-9A-Fa-f]{2})*\z/
 
   @doc "Validate a persisted session policy without resolving any credentials."
   def valid_session?(%Session{protected: nil}), do: true
@@ -116,13 +187,10 @@ defmodule Managoat.Broker.ProtectedRule do
     HTTP.valid_host?(policy.host) and not String.contains?(policy.host, "*") and
       policy.host == String.downcase(policy.host) and
       is_integer(policy.port) and policy.port in 1..65_535 and
-      is_list(policy.paths) and policy.paths != [] and Enum.all?(policy.paths, &safe_path?/1) and
-      is_list(policy.methods) and policy.methods != [] and
-      Enum.all?(policy.methods, &(&1 in ~w(GET POST PUT PATCH DELETE HEAD OPTIONS))) and
+      valid_routes?(policy) and
       safe_identity?(policy.identity) and allowed_header?(policy.identity_header) and
       is_list(policy.allowed_headers) and Enum.all?(policy.allowed_headers, &allowed_header?/1) and
-      (is_nil(policy.name) or is_binary(policy.name)) and
-      query(policy) in [:refuse, :allow]
+      (is_nil(policy.name) or is_binary(policy.name))
   rescue
     _ -> false
   end
@@ -140,16 +208,15 @@ defmodule Managoat.Broker.ProtectedRule do
 
   def select(%Session{protected: policy}, request) do
     if String.downcase(request.host) == policy.host do
+      matching =
+        if request.scheme == :https and request.port == policy.port,
+          do: matching_routes(policy, request.method, request.target),
+          else: []
+
       cond do
-        not (request.scheme == :https and request.port == policy.port and
-               request.method in policy.methods and allowed_target?(policy, request.target)) ->
-          {:error, :protected_destination}
-
-        query(policy) != :allow and String.contains?(request.target, "?") ->
-          {:error, :protected_query}
-
-        true ->
-          {:ok, policy}
+        matching == [] -> {:error, :protected_destination}
+        Enum.any?(matching, &query_allowed?(&1.query, request.target)) -> {:ok, policy}
+        true -> {:error, :protected_query}
       end
     else
       :ordinary
@@ -210,24 +277,112 @@ defmodule Managoat.Broker.ProtectedRule do
   def response_secrets(_rule, _headers), do: nil
 
   # A policy persisted by a release that had no `query` key has none, and
-  # reads as the default rather than as an invalid session.
+  # reads as the default rather than as an invalid session. Likewise one
+  # persisted before `routes` existed has no `routes` key, and reads as a
+  # policy without routes.
   defp query(policy), do: Map.get(policy, :query, :refuse)
+  defp explicit_routes(policy), do: Map.get(policy, :routes)
+
+  # Every policy as a list of routes. Without `routes`, the joint fields are
+  # one route per path, each carrying all the methods and the one query
+  # policy, which is exactly what they meant before routes existed.
+  defp routes(policy) do
+    case explicit_routes(policy) do
+      nil ->
+        for path <- policy.paths, do: %{path: path, methods: policy.methods, query: query(policy)}
+
+      routes ->
+        Enum.map(
+          routes,
+          &%{path: &1.path, methods: &1.methods, query: Map.get(&1, :query, :refuse)}
+        )
+    end
+  end
+
+  defp valid_routes?(policy) do
+    case explicit_routes(policy) do
+      nil ->
+        valid_paths?(policy.paths) and valid_methods?(policy.methods) and
+          query(policy) in [:refuse, :allow]
+
+      routes ->
+        # `routes` replaces the joint fields. One set alongside the other is
+        # a policy written two ways, and nobody can say which was meant.
+        is_list(routes) and routes != [] and Enum.all?(routes, &valid_route?/1) and
+          Map.get(policy, :paths) in [nil, []] and Map.get(policy, :methods) in [nil, []] and
+          query(policy) == :refuse
+    end
+  end
+
+  defp valid_route?(%{path: path, methods: methods} = route) when not is_struct(route) do
+    Enum.all?(Map.keys(route), &(&1 in [:path, :methods, :query])) and safe_path?(path) and
+      valid_methods?(methods) and valid_query_policy?(Map.get(route, :query, :refuse))
+  end
+
+  defp valid_route?(_route), do: false
+
+  defp valid_paths?(paths),
+    do: is_list(paths) and paths != [] and Enum.all?(paths, &safe_path?/1)
+
+  defp valid_methods?(methods),
+    do: is_list(methods) and methods != [] and Enum.all?(methods, &(&1 in @methods))
+
+  defp valid_query_policy?(policy) when policy in [:refuse, :allow], do: true
+
+  defp valid_query_policy?({:only, names}) when is_list(names) and names != [] do
+    Enum.all?(names, &(is_binary(&1) and Regex.match?(@param_name, &1))) and
+      Enum.uniq(names) == names
+  end
+
+  defp valid_query_policy?(_policy), do: false
+
+  defp matching_routes(policy, method, target) do
+    path = target |> String.split("?", parts: 2) |> hd()
+
+    if safe_path?(path) do
+      Enum.filter(routes(policy), &(method in &1.methods and path_allowed?(&1.path, path)))
+    else
+      []
+    end
+  end
+
+  defp path_allowed?(allowed, path) do
+    if String.ends_with?(allowed, "/"),
+      do: String.starts_with?(path, allowed),
+      else: path == allowed
+  end
+
+  defp query_allowed?(:allow, _target), do: true
+
+  defp query_allowed?(policy, target) do
+    case String.split(target, "?", parts: 2) do
+      [_path] -> true
+      [_path, query] -> policy != :refuse and pinned_query?(policy, query)
+    end
+  end
+
+  # `{:only, names}`: the raw query, pair by pair, before anything decodes
+  # it. See "Queries" in the moduledoc for each refusal.
+  defp pinned_query?({:only, names}, query) do
+    pairs = String.split(query, "&")
+
+    Enum.all?(pairs, fn pair ->
+      case String.split(pair, "=", parts: 2) do
+        [name, value] -> name in names and pinned_value?(value)
+        [_bare] -> false
+      end
+    end) and length(Enum.uniq_by(pairs, &hd(String.split(&1, "=", parts: 2)))) == length(pairs)
+  end
+
+  defp pinned_value?(value) do
+    Regex.match?(@param_value, value) and
+      not Regex.match?(~r/[\x00-\x1F\x7F]/, URI.decode_www_form(value))
+  end
 
   defp conflicting?(%Rule{scheme: :passthrough}, _request), do: false
 
   defp conflicting?(%Rule{} = rule, request),
     do: Injector.matches?(rule.pattern, request.host, request.port, request.target)
-
-  defp allowed_target?(policy, target) do
-    path = target |> String.split("?", parts: 2) |> hd()
-
-    safe_path?(path) and
-      Enum.any?(policy.paths, fn allowed ->
-        if String.ends_with?(allowed, "/"),
-          do: String.starts_with?(path, allowed),
-          else: path == allowed
-      end)
-  end
 
   defp safe_path?("/" <> _ = path) do
     not Regex.match?(~r/[\x00-\x20\x7F%\\?#]/, path) and

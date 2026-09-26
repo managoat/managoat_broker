@@ -10,6 +10,34 @@ the package ships without a bump fails the release gate.
 
 ## [Unreleased]
 
+### Added
+
+- **`ProtectedRule.routes`: per-route method and query policy.** A list of
+  `%{path: binary, methods: [binary], query: :refuse | :allow | {:only,
+  [binary]}}` (`query` optional, default `:refuse`), replacing `paths`,
+  `methods` and `query` when set, so that one route of a protected
+  destination can take a method or query another may not. A request is
+  admitted when one route matches its path, method and query; one matching
+  no route's path and method is `:protected_destination`, one whose query
+  none of those routes admits is `:protected_query`. Everything else about a
+  protected request (bearer and identity injection, the header allowlist,
+  `Accept-Encoding: identity`, the response search, upgrade refusal, the
+  ordinary-rule conflict check) holds on every route. `valid_session?/1`
+  refuses a malformed route, an unknown route key, and a policy that sets
+  `routes` alongside `paths`, `methods` or a non-default `query`.
+- **`{:only, names}` query policy**, on a route only. A query is admitted
+  when it is `name=value` pairs, each name exactly one of `names` (raw
+  bytes, case-sensitive) and at most once, each value unreserved characters,
+  well-formed `%XX` escapes or `+ , : @ ! $ ' ( ) * /`, not decoding to a
+  control character; it is then forwarded unchanged. Anything else,
+  including `;`, a repeated name, an empty pair or a bare `path?`, is
+  `:protected_query`.
+
+`paths` and `methods` are no longer enforced keys of the struct, since a
+policy with `routes` leaves them unset. A policy without `routes`, including
+one persisted by 0.15.0 that has no `routes` key, behaves exactly as before
+and still requires both.
+
 ## [0.15.0] - 2026-09-21
 
 Two gates on the protected path, both on by default. **Breaking for a host

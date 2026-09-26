@@ -306,6 +306,33 @@ The proxy enforces the policy independently of what ordinary rules say:
   is a parameter to that operation which nobody pinned. A host whose routes
   do take a query sets `query: :allow`, and it is then forwarded unchanged,
   never templated.
+- **Per-route policy.** `paths`, `methods` and `query` hold jointly: every
+  method and the query policy apply on every path. Where one route must be
+  narrower than another under the same bearer, set `routes` instead, and
+  leave `paths` and `methods` unset:
+
+  ```elixir
+  routes: [
+    %{path: "/backend-api/codex/responses", methods: ["POST"], query: :refuse},
+    %{path: "/backend-api/codex/models", methods: ["GET"],
+      query: {:only, ["client_version"]}}
+  ]
+  ```
+
+  A request is admitted when one route matches its path, its method and its
+  query; overlapping routes are a union. A route's `query` defaults to
+  `:refuse`. `{:only, names}` admits a query only when it is `name=value`
+  pairs whose every name is one of `names`, each at most once, compared as
+  raw bytes (no percent-encoded or otherwise respelled name matches), with
+  values limited to unreserved characters, well-formed `%XX` escapes and
+  `+ , : @ ! $ ' ( ) * /`, and never decoding to a control character. `;`,
+  a repeated name, an empty pair and a bare `path?` are refused. An admitted
+  query is forwarded byte for byte. A pinned name set gives the sandbox the
+  values of parameters the host chose, which is what it already writes in
+  the body, rather than any parameter the origin understands; pin only
+  parameters whose every value is harmless. A policy with `routes` must not
+  also set `paths`, `methods` or a non-default `query`, and one without
+  `routes` (including one persisted by 0.15) behaves exactly as before.
 - A matching ordinary injection rule is a conflict (403) before credential
   resolution; passthrough rules are harmless. Rules for other destinations
   still work. That ordinary path receives no protected credential, and a
