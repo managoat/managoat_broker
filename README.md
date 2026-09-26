@@ -144,9 +144,9 @@ the agent doing anything wrong, and `502` is what tells it to retry once
 the credential is provisioned. `403` would say it is not allowed, which is
 a different and misleading thing. Inside a tunnel the request is refused
 without ending the tunnel, unless the refused request left a body behind it
-in the stream. `:substitute` and an unfilled `{{ KEY }}` are the exceptions
-described above: a placeholder the origin can see is the clearer failure
-there.
+in the stream or an earlier response is still being relayed. `:substitute`
+and an unfilled `{{ KEY }}` are the exceptions described above: a
+placeholder the origin can see is the clearer failure there.
 
 A placeholder must be distinctive enough to be one: four characters or
 more, holding a letter or digit, and carrying a boundary — `__` at either
@@ -197,8 +197,11 @@ an authorization failure.
 Denied authority (including a locally expired opted-in session) returns
 **403** with `error: :authorization_denied`. Unavailable authority, a missing
 callback, an exception/exit/throw or a malformed result returns **503** with
-`error: :authorization_unavailable`. Both close the client connection;
-callback payloads and exception messages are neither logged nor returned.
+`error: :authorization_unavailable`. On the absolute-form path both close
+the client connection; inside a tunnel a bodyless 403 keeps the tunnel (see
+"Connections, and who decides them") and the next request is authorized
+again, while a 503 closes it. Callback payloads and exception messages are
+neither logged nor returned.
 A missing grant or session must be denied by the host, even if its initial
 lookup succeeded on a different node before revocation.
 
@@ -226,7 +229,8 @@ matches or what its authorization callback returns.
   token, and a nested CONNECT inside the intercepted tunnel. Check before
   credential resolution, then check the effective headers after templates
   and substitution. Refusals return 403 with `error: :protocol_upgrade`
-  and close; no rejected request is forwarded to the origin. Invalid
+  and close, even inside a tunnel where other bodyless denials keep it; no
+  rejected request is forwarded to the origin. Invalid
   header names and value control characters also return 403 with
   `error: :unsafe_request`, so a template cannot manufacture hidden wire
   headers with a newline in an unrelated value. Reject ambiguous request
@@ -444,6 +448,19 @@ refusal.
 
 `CONNECT` tunnels keep alive too. Rule processing, and authorization for
 opted-in sessions, run for each HTTP request inside the tunnel.
+
+A refusal inside a tunnel refuses the request, not the tunnel. A `403` (a
+denial: `deny` policy, a protected route or query, denied authority, a
+conflict) or a `502` (`:credential_missing`) is answered without
+`connection: close` and the tunnel goes on to the next request, which is
+decided afresh — so a client refused one route of a host can reach an
+allowed route of it without a new TCP and TLS connection. The tunnel still
+closes when the refused request carried a body (the proxy does not read a
+body it is refusing, so the next request could not be found in the stream),
+when an earlier response on the tunnel is still being relayed (the proxy's
+own reply would otherwise land inside it), on a `503`, and on the HTTP-only
+refusals of a request's own shape (`:protocol_upgrade`, `:unsafe_request`).
+Absolute-form plain HTTP still closes on any refusal, as above.
 
 ## The child spec
 

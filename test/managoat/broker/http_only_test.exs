@@ -213,8 +213,15 @@ defmodule Managoat.Broker.HTTPOnlyTest do
     assert {:error, :closed} = :ssl.recv(first, 0, 2_000)
     Agent.update(authority, fn _ -> {:error, :denied} end)
     :ssl.send(second, "GET /after-fence HTTP/1.1\r\nHost: localhost\r\n\r\n")
-    assert recv_until(second, "\r\n\r\n") =~ "403 Forbidden"
-    assert {:error, :closed} = :ssl.recv(second, 0, 2_000)
+    denied = recv_until(second, "\r\n\r\n")
+    assert denied =~ "403 Forbidden"
+
+    # A denial is about the request; the tunnel stays, and the authority is
+    # asked again for the next one on it.
+    refute denied =~ "connection: close"
+    Agent.update(authority, fn _ -> {:ok, session.rules} end)
+    {_, body} = request(second, "GET /restored HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert body["headers"]["authorization"] == "Bearer fresh-managed"
   end
 
   defp recv_plain_until(tcp, needle, acc) do

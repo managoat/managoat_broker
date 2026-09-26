@@ -79,8 +79,15 @@ defmodule Managoat.Broker.Proxy do
   matched rule whose credential the host never supplied, which is a `502`
   with `error: :credential_missing`: the broker failed to obtain a
   credential rather than deciding anything, and an agent should retry once
-  it is provisioned. Inside a tunnel that `502` refuses the request without
-  ending the tunnel, where the refused request left no body behind it.
+  it is provisioned.
+
+  Inside a tunnel a `502` and a `403` both refuse the request without ending
+  the tunnel, where the refused request left no body behind it and every
+  earlier response on the tunnel has been relayed in full; the next request
+  on it is authorized afresh, exactly as the first was. A request with a
+  body, a refusal made while an earlier response is still on its way, a
+  `503`, and the two HTTP-only refusals of the request's own shape
+  (`:protocol_upgrade`, `:unsafe_request`) still close the tunnel.
 
   A response can be refused too, for a protected request only: one that
   repeats the bearer it was sent with (`error: :credential_reflected`) or
@@ -189,6 +196,12 @@ defmodule Managoat.Broker.Proxy do
   # for requests that never got an answer. A telemetry event is not worth
   # hanging a connection teardown on.
   @relay_stop_timeout 1_000
+
+  # How long a refusal that would keep its tunnel waits for the relay to
+  # write it. The relay answers at once unless it is blocked writing an
+  # earlier response to a client that is not reading, and then the tunnel
+  # closes as it did before refusals could keep it.
+  @answer_timeout 5_000
 
   # How many times one connection may be answered with a `407` before the
   # proxy stops reading from it. Two is enough for the negotiation this
@@ -687,6 +700,20 @@ defmodule Managoat.Broker.Proxy do
           HTTPOnly.expect(gate, request.method, ReflectionGuard.new(secrets))
         )
 
+      # A refusal the handler made itself, to be written only where it
+      # cannot land inside an origin's response: every request expected so
+      # far has been answered in full and the gate holds nothing. Descriptors
+      # arrive in the order the handler sent them, so any request forwarded
+      # before the refused one has already been expected here.
+      {:answer, from, ref, bytes} ->
+        if Response.idle?(framer) and Response.boundary?(framer) and HTTPOnly.idle?(gate) do
+          send(from, {ref, :ssl.send(client, bytes)})
+        else
+          send(from, {ref, :busy})
+        end
+
+        relay(upstream, client, framer, gate)
+
       {:ssl, ^upstream, data} ->
         :ssl.setopts(upstream, active: :once)
 
@@ -899,28 +926,82 @@ defmodule Managoat.Broker.Proxy do
     end
   end
 
-  # A refusal written into an open tunnel. A `502` for a credential the
-  # broker could not obtain is about this request and not this connection —
-  # the next request on the tunnel may match a rule that is provisioned — so
-  # the tunnel survives it, as long as the refused request left nothing
-  # behind it in the stream. A request with a body did: the proxy is not
+  # A refusal written into an open tunnel. A refusal is about this request
+  # and not this connection, so the tunnel survives it where it safely can,
+  # and the next request on it goes through `authorize_and_inject/4` exactly
+  # as the first did: nothing about a refusal, or about an earlier request,
+  # is remembered on the tunnel.
+  #
+  # A `502` for a credential the broker could not obtain is the broker's
+  # failure; the next request may match a rule that is provisioned. A `403`
+  # denies this request, and the next one is often to a path of the same
+  # host that is allowed: a managed session refuses most routes of a host
+  # whose one protected route shares it. Closing on every denial made each
+  # refused request cost the client a fresh TCP and TLS connection, and a
+  # client that keeps asking turned that into thousands of tunnels an hour
+  # through the sandbox's network. So both keep the tunnel.
+  #
+  # Four things still close it. A `503`: the authority could not answer,
+  # and nothing about the next request would be different. A request with a
+  # body: the proxy is not
   # forwarding that body and will not read one it is refusing, so the
   # framing would be lost and the next head would be read out of the middle
-  # of it.
-  #
-  # A denial is the other thing. `403` says this session may not reach here,
-  # which the next request would only hear again, so it closes as before.
+  # of it. A refusal of the request's own shape under HTTP-only
+  # (`:protocol_upgrade`, `:unsafe_request`): framing the proxy judged
+  # ambiguous or an attempt to leave HTTP is not a stream to go on reading.
+  # And an earlier response still on its way: the relay writes the refusal,
+  # and only when everything expected so far has been answered in full, so
+  # the proxy's own reply can never land inside an origin's.
   defp refuse_in_tunnel(conn, rest, framing, reason) do
     status = refusal_status(reason)
 
-    if status == 502 and bodyless?(framing) do
-      reply(conn.client, 502, "Bad Gateway")
-      serve(conn, rest)
+    if keeps_tunnel?(status, reason) and bodyless?(framing) do
+      case answer_in_turn(conn.relay, refusal_reply(status)) do
+        :ok -> serve(conn, rest)
+        :busy -> close_with(conn.client, status)
+        :gone -> :client_closed
+      end
     else
-      reply(conn.client, status, status_reason(status), [{"connection", "close"}])
-      :client_closed
+      close_with(conn.client, status)
     end
   end
+
+  defp keeps_tunnel?(status, reason) when status in [403, 502],
+    do: reason not in [:protocol_upgrade, :unsafe_request]
+
+  defp keeps_tunnel?(_status, _reason), do: false
+
+  defp close_with(client, status) do
+    reply(client, status, status_reason(status), [{"connection", "close"}])
+    :client_closed
+  end
+
+  # Hand the reply to the relay, which alone knows whether the stream is
+  # between responses. `:gone` covers a relay that has ended (the origin
+  # closed, and it closed the client with it), a client that could not be
+  # written to, and a relay that did not answer in time; none of them leaves
+  # a tunnel to keep, and the handler writes nothing more. (A relay that
+  # answers late still writes the reply only between responses, so the
+  # worst it does is precede the close with a well-formed `403`.)
+  defp answer_in_turn(relay, bytes) do
+    ref = Process.monitor(relay)
+    send(relay, {:answer, self(), ref, bytes})
+
+    receive do
+      {^ref, result} ->
+        Process.demonitor(ref, [:flush])
+        if result in [:ok, :busy], do: result, else: :gone
+
+      {:DOWN, ^ref, :process, ^relay, _} ->
+        :gone
+    after
+      @answer_timeout ->
+        Process.demonitor(ref, [:flush])
+        :gone
+    end
+  end
+
+  defp refusal_reply(status), do: reply_bytes(status, status_reason(status), [])
 
   # Did this request leave anything after its head for the next read to trip
   # over? A declared length of zero is a body, and is no bytes.
@@ -1453,13 +1534,17 @@ defmodule Managoat.Broker.Proxy do
   end
 
   defp reply(socket, status, reason, headers \\ []) do
-    lines = Enum.map(headers ++ [{"content-length", "0"}], fn {k, v} -> [k, ": ", v, "\r\n"] end)
-    data = ["HTTP/1.1 ", Integer.to_string(status), " ", reason, "\r\n", lines, "\r\n"]
+    data = reply_bytes(status, reason, headers)
 
     case socket do
       %Socket{} -> Socket.send(socket, data)
       ssl -> :ssl.send(ssl, data)
     end
+  end
+
+  defp reply_bytes(status, reason, headers) do
+    lines = Enum.map(headers ++ [{"content-length", "0"}], fn {k, v} -> [k, ": ", v, "\r\n"] end)
+    ["HTTP/1.1 ", Integer.to_string(status), " ", reason, "\r\n", lines, "\r\n"]
   end
 
   # What the proxy knows about a request while it waits for the answer:

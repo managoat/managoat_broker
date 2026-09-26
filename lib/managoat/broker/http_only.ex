@@ -83,6 +83,15 @@ defmodule Managoat.Broker.HTTPOnly do
   def expect(state, method, guard), do: %{state | pending: state.pending ++ [{method, guard}]}
 
   @doc """
+  Is the gate between responses: nothing expected, nothing held? A reply the
+  proxy writes itself may only go out then.
+  """
+  @spec idle?(t() | nil) :: boolean()
+  def idle?(nil), do: true
+  def idle?(%__MODULE__{pending: [], body: nil, buffer: ""}), do: true
+  def idle?(%__MODULE__{}), do: false
+
+  @doc """
   The origin closed. Bytes a guard was still holding were the start of
   nothing, and belong to a body that only the close ends.
   """

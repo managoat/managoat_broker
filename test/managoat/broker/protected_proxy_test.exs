@@ -170,6 +170,57 @@ defmodule Managoat.Broker.ProtectedProxyTest do
     refute_received {:authorize, _}
   end
 
+  describe "a protected destination refused inside a tunnel" do
+    # The managed route shares its host with routes the session is refused,
+    # and a client keeps asking for those. Each refusal used to close the
+    # tunnel (managoat/fountain#2503).
+    test "keeps a bodyless request's tunnel, and the protected route still injects", ctx do
+      tls = tunnel(ctx, ctx.token)
+      on_exit(fn -> :ssl.close(tls) end)
+
+      for path <- ["/other", "/allowed/suffix", "/report?x=1"] do
+        :ok = :ssl.send(tls, raw(path))
+        reply = recv_until(tls, "\r\n\r\n")
+        assert reply =~ "HTTP/1.1 403 Forbidden"
+        refute reply =~ "connection: close"
+      end
+
+      refute_received {:authorize, %{protected: true}}
+
+      {_, %{"reported" => true}} = request(tls, raw("/report"))
+      assert_receive {:origin_saw, %{headers: %{"authorization" => "Bearer managed-secret"}}}
+      assert_receive {:authorize, %{protected: true, target: "/report"}}
+
+      assert_receive {:request, %{count: 1},
+                      %{path: "/other", status: 403, error: :protected_destination}}
+
+      assert_receive {:request, _, %{path: "/allowed/suffix", status: 403}}
+      assert_receive {:request, _, %{path: "/report", status: 403, error: :protected_query}}
+
+      assert_receive {:request, _,
+                      %{path: "/report", status: 200, error: nil, scheme: :protected_bearer}}
+
+      refute_receive {:request, _, %{path: "/other"}}, 200
+    end
+
+    test "still closes when the refused request carried a body", ctx do
+      tls = tunnel(ctx, ctx.token)
+
+      :ok =
+        :ssl.send(
+          tls,
+          "POST /other HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody"
+        )
+
+      reply = recv_until(tls, "\r\n\r\n")
+      assert reply =~ "HTTP/1.1 403"
+      assert reply =~ "connection: close"
+      assert {:error, :closed} = :ssl.recv(tls, 0, 2_000)
+      assert_receive {:request, _, %{path: "/other", status: 403, error: :protected_destination}}
+      refute_receive {:request, _, %{path: "/other"}}, 200
+    end
+  end
+
   test "unapproved HTTP methods cannot resolve a credential", ctx do
     tls = tunnel(ctx, ctx.token)
     :ssl.send(tls, "TRACE /allowed HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -705,10 +756,19 @@ defmodule Managoat.Broker.ProtectedProxyTest do
 
   defp failure(kind), do: {kind, "secret-in-error"}
 
+  # A bodyless `403` keeps its tunnel, so the next request on it is decided
+  # afresh; a `503` still closes it.
   defp assert_refused(tls, path, status) do
     :ssl.send(tls, raw(path))
-    assert recv_until(tls, "\r\n\r\n") =~ "HTTP/1.1 #{status}"
-    assert {:error, :closed} = :ssl.recv(tls, 0, 2_000)
+    reply = recv_until(tls, "\r\n\r\n")
+    assert reply =~ "HTTP/1.1 #{status}"
+
+    if status == 403 do
+      refute reply =~ "connection: close"
+      assert {:error, :timeout} = :ssl.recv(tls, 0, 100)
+    else
+      assert {:error, :closed} = :ssl.recv(tls, 0, 2_000)
+    end
   end
 
   defp raw(path, headers \\ ""),

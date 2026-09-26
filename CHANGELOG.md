@@ -38,6 +38,31 @@ policy with `routes` leaves them unset. A policy without `routes`, including
 one persisted by 0.15.0 that has no `routes` key, behaves exactly as before
 and still requires both.
 
+### Changed
+
+- **A `403` inside a `CONNECT` tunnel no longer closes the tunnel.** A
+  denial (`deny` policy, a protected route or query, denied authority, a
+  conflict) on a request with no body is answered without
+  `connection: close`, and the next request on the tunnel is decided
+  afresh, as a `502` for a missing credential already was. A client refused
+  some routes of a host it may otherwise reach — a managed session's host
+  shares its one protected route with routes it refuses — used to pay a new
+  TCP and TLS connection for every refusal (managoat/fountain#2503). The
+  tunnel still closes when the refused request carried a body, on a `503`,
+  and on the HTTP-only refusals of a request's own shape
+  (`:protocol_upgrade`, `:unsafe_request`). Telemetry is unchanged: one
+  terminal event per refused request, with the same status and error.
+
+### Fixed
+
+- **A refusal the proxy writes into a tunnel can no longer land inside an
+  origin's response.** The kept-tunnel reply (the `502` before, the `403`
+  too now) was written by the handler without regard to the relay, so a
+  refused request pipelined behind a response still being relayed was
+  answered ahead of, or in the middle of, that response. The relay now
+  writes it, and only when every earlier request has been answered in full;
+  otherwise the tunnel closes as before.
+
 ## [0.15.0] - 2026-09-21
 
 Two gates on the protected path, both on by default. **Breaking for a host

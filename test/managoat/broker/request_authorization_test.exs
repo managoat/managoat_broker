@@ -231,7 +231,15 @@ defmodule Managoat.Broker.RequestAuthorizationTest do
     response = recv_until(tls, "\r\n\r\n")
     assert response =~ "HTTP/1.1 #{status}"
     refute response =~ "token"
-    assert {:error, :closed} = :ssl.recv(tls, 0, 2_000)
+
+    # A bodyless denial keeps the tunnel, and the next request on it is
+    # authorized afresh; an authority that could not answer still closes it.
+    if status == 403 do
+      refute response =~ "connection: close"
+      assert {:error, :timeout} = :ssl.recv(tls, 0, 100)
+    else
+      assert {:error, :closed} = :ssl.recv(tls, 0, 2_000)
+    end
   end
 
   defp plain_request(ctx, target) do
