@@ -8,6 +8,14 @@ include breaking changes and says so; patch releases are always safe to take.
 Merging a version bump to `main` publishes it to hex; a PR that changes what
 the package ships without a bump fails the release gate.
 
+## [0.18.0]
+
+- Allow stores to distinguish unavailable lookup authority from invalid tokens
+  with `{:error, :unavailable}`. CONNECT and absolute-form requests fail closed
+  with 503 and no upstream connection or authentication challenge. Existing
+  `:error` results still receive 407. The connect event gains the fixed
+  `:lookup_unavailable` outcome; consumers enumerating outcomes must allow it.
+
 ## [0.17.0]
 
 - Add opt-in CONNECT diagnostics (`diagnostics_interval`, disabled by default):

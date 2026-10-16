@@ -63,7 +63,9 @@ tunnel's fixed destination makes sensible); on the absolute-form path it is
 looked up per request, since each request carries its own and trusting the
 first would serve a token the proxy never checked.
 `proxy-authorization` never reaches the origin. A missing, unknown or
-expired token is `407`.
+expired token is `407`. A store returning `{:error, :unavailable}` refuses
+lookup with `503`, closes the connection and never dials an upstream. It does
+not issue an authentication challenge or retry the request.
 
 Two guards protect the operator's network and the tenant's intent:
 
@@ -87,7 +89,8 @@ Two guards protect the operator's network and the tenant's intent:
 ## The `Store` behaviour
 
 ```elixir
-@callback lookup(token :: binary()) :: {:ok, Managoat.Broker.Session.t()} | :error
+@callback lookup(token :: binary()) ::
+  {:ok, Managoat.Broker.Session.t()} | :error | {:error, :unavailable}
 ```
 
 For lookup-only sessions, that is all the proxy needs: the raw token in, a session

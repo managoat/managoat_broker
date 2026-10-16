@@ -99,11 +99,11 @@ defmodule Managoat.Broker.Proxy do
 
   Beside it, every connection the proxy decides about emits `[:managoat,
   :broker, :connect]` with `%{count: 1}` and the metadata `host`, `port`,
-  `outcome` (`:ok`, `:upstream_failed`, `:denied` or `:unauthenticated`)
+  `outcome` (`:ok`, `:upstream_failed`, `:denied`, `:unauthenticated` or `:lookup_unavailable`)
   and `meta`. That event is emitted on every path, the ones that never
   reach an origin included, so "how much of this broker's egress is
   failing" is a ratio over it rather than a count with no denominator. On
-  `:unauthenticated` there is no session and no destination yet, so `host`
+  `:unauthenticated` or `:lookup_unavailable` there is no session and no destination yet, so `host`
   and `port` are nil and `meta` is empty.
 
   It counts *origin* connections, not sandbox ones. A `CONNECT` tunnel is
@@ -360,6 +360,12 @@ defmodule Managoat.Broker.Proxy do
          false <- Session.expired?(session, DateTime.utc_now()) do
       {:ok, session}
     else
+      {:error, :unavailable} ->
+        log_refusal(:lookup_unavailable)
+        connect_event(nil, nil, nil, :lookup_unavailable)
+        reply(socket, 503, "Service Unavailable")
+        {:error, :lookup_unavailable}
+
       reason ->
         log_refusal(refusal(reason))
         connect_event(nil, nil, nil, :unauthenticated)
@@ -415,6 +421,9 @@ defmodule Managoat.Broker.Proxy do
     case Store.lookup(store, token) do
       {:ok, %Session{} = session} ->
         if ProtectedRule.valid_session?(session), do: {:ok, session}, else: :error
+
+      {:error, :unavailable} = error ->
+        error
 
       _ ->
         :error
@@ -1701,7 +1710,8 @@ defmodule Managoat.Broker.Proxy do
   # not resolve, an origin that will not connect); `:denied` is the `403`
   # path (a host outside a `deny` session's rules, or one that resolves into
   # the operator's own network); `:unauthenticated` is the `407`, where
-  # there is no session yet and so no host to name.
+  # there is no session yet and so no host to name. `:lookup_unavailable`
+  # is the 503 before a session can be resolved, also without a host.
   defp connect_event(session, host, port, outcome) do
     :telemetry.execute([:managoat, :broker, :connect], %{count: 1}, %{
       host: host,

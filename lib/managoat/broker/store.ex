@@ -5,7 +5,8 @@ defmodule Managoat.Broker.Store do
   A sandbox dials the proxy with `Proxy-Authorization: Basic
   base64(token:label)`. The proxy hands the raw `token` to the store and
   serves the connection under the `Managoat.Broker.Session` it gets back,
-  or refuses it with 407. Everything else about sessions (creating one,
+  or refuses it with 407 for invalid credentials or 503 when lookup is
+  unavailable. Everything else about sessions (creating one,
   hashing the token before storing it, encrypting the rules, releasing a
   conversation's sessions, sweeping expired rows) is the host's business:
   it touches the host's tables and its key hierarchy, and the proxy never
@@ -28,11 +29,19 @@ defmodule Managoat.Broker.Store do
 
   alias Managoat.Broker.{ProtectedCredential, Rule, Session}
 
-  @doc "The session for a raw token, or `:error` for a token the store does not know."
-  @callback lookup(token :: binary()) :: {:ok, Session.t()} | :error
+  @typedoc "Session lookup distinguishes rejected credentials from unavailable authority."
+  @type lookup_result :: {:ok, Session.t()} | :error | {:error, :unavailable}
+
+  @doc """
+  Return the session for a raw token, `:error` for unknown/rejected credentials,
+  or `{:error, :unavailable}` when authority cannot be checked. Unavailability
+  fails closed with 503, without an authentication challenge or upstream dial.
+  Never return cached success on failure; bound callback waits in the host.
+  """
+  @callback lookup(token :: binary()) :: lookup_result()
 
   @doc "The same, for a store with several instances (see the moduledoc)."
-  @callback lookup(instance :: term(), token :: binary()) :: {:ok, Session.t()} | :error
+  @callback lookup(instance :: term(), token :: binary()) :: lookup_result()
 
   @typedoc "Actual proxy destination and original request line, before rule processing."
   @type request :: %{
@@ -85,7 +94,7 @@ defmodule Managoat.Broker.Store do
   @type ref :: module() | {module(), term()}
 
   @doc false
-  @spec lookup(ref(), binary()) :: {:ok, Session.t()} | :error
+  @spec lookup(ref(), binary()) :: lookup_result()
   def lookup(module, token) when is_atom(module), do: module.lookup(token)
   def lookup({module, instance}, token) when is_atom(module), do: module.lookup(instance, token)
 
