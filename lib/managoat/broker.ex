@@ -46,6 +46,7 @@ defmodule Managoat.Broker do
   | `max_request_bytes` | default 1 GiB. The largest request body the proxy will forward; `:infinity` for none |
   | `max_response_bytes` | default `:infinity`. The largest response body the proxy will relay |
   | `request_read_timeout` | default 5 minutes, in milliseconds. The wall clock the proxy will spend reading one request, head and body; `:infinity` for none. It does not bound the response |
+  | `diagnostics_interval` | default `nil` (off). Positive milliseconds between CONNECT progress samples; see README diagnostics. Does not impose a timeout |
   | `max_cached_leaves` | default 1024. How many signed per-host leaves the listener caches before evicting the least recently used |
   | `name` | default `Managoat.Broker`. The supervisor's name; `port/1`, `running?/1` and `ca_pem/1` take it |
 
@@ -82,6 +83,12 @@ defmodule Managoat.Broker do
       raise ArgumentError, "Managoat.Broker's :ca_seed must be 32 bytes"
     end
 
+    interval = Keyword.get(opts, :diagnostics_interval)
+
+    unless is_nil(interval) or (is_integer(interval) and interval > 0) do
+      raise ArgumentError, ":diagnostics_interval must be a positive millisecond interval or nil"
+    end
+
     Supervisor.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
@@ -111,7 +118,7 @@ defmodule Managoat.Broker do
                  upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
                  max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
                  max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity)
-               ] ++ Keyword.take(opts, [:request_read_timeout]),
+               ] ++ Keyword.take(opts, [:request_read_timeout, :diagnostics_interval]),
              read_timeout: @idle_timeout,
              supervisor_options: [name: listener_name(name)]
            ]
