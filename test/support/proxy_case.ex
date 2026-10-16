@@ -362,7 +362,7 @@ defmodule Managoat.Broker.ProxyCase do
              ],
              Keyword.get(opts, :upstream_ssl_options, [])
            )
-       ] ++ Keyword.take(opts, [:request_read_timeout])}
+       ] ++ Keyword.take(opts, [:request_read_timeout, :diagnostics_interval])}
     )
 
     %{

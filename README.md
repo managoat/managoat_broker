@@ -593,6 +593,51 @@ only the event is narrowed. This is Agent Vault's contract too: its
 request log recorded `r.URL.Path`. A `CONNECT` names an authority rather
 than a path, and is reported as it was sent.
 
+### Opt-in CONNECT diagnostics
+
+Set `diagnostics_interval: 5_000` on the listener to emit
+`[:managoat, :broker, :diagnostic]`. The default is `nil` (off). It is an
+observation interval, **not a response timeout**. This covers authenticated,
+allowed CONNECT attempts; absolute-form HTTP and refusals before tunnel setup
+retain their existing events.
+
+Each attempt has a random `connection_id`, `host`, `port` and the session's
+unchanged `meta`. Events are:
+
+- `event: :phase`: `phase` is `:dns`, `:upstream_connect` (TCP plus TLS,
+  including alternate-address attempts), or `:client_tls` (certificate lookup
+  plus sandbox handshake). `duration` is native monotonic time; `outcome` is
+  `:ok` or `:error`. Failed sandbox handshakes now carry session correlation.
+- `event: :request_start`: a forwarded request is about to be written upstream.
+  `request_id` also appears on its existing terminal request event, along with
+  `connection_id`. No target, path, header, body or transport error is included
+  in the diagnostic. A start does not prove the origin received the request.
+- `event: :progress`: sampled during setup or while requests are outstanding.
+  Idle keep-alive tunnels are silent. `phase` names the setup step or `:serving`.
+- `event: :stop`: the final snapshot on orderly handler completion
+  (`reason: :handler_done`) or unexpected exit (`:handler_exit`). These are
+  handler lifecycle reasons, not a replacement for per-request terminal errors.
+
+Progress and stop measurements are cumulative **per tunnel**, not per request:
+`duration`, `upstream_bytes` received, `client_bytes` accepted by successful TLS
+writes, `client_write_duration` spent in completed writes,
+`client_write_in_flight` spent in the current blocked write, `requests`, and
+`pending_requests`. `first_byte` is time from tunnel setup beginning until its
+first upstream byte (not request TTFB), and `upstream_idle` is time since the
+latest upstream byte; both are absent until data arrives. All durations are in
+native units. Bytes are plaintext origin octets including HTTP framing (and
+frames after an upgrade), not TLS wire bytes. The downstream count excludes failed writes, withheld/rejected data and
+proxy-generated refusals; successful writes do not prove client consumption.
+
+An independent observer samples atomic counters, so a relay blocked in a client
+write can still report `client_writing: true`. Snapshots are approximate across
+concurrent counter updates. They distinguish no upstream bytes, partial upstream
+progress, and downstream write pressure; they do not alone identify a network
+fault. The observer exits with the handler and never controls its lifetime.
+Handlers should remain fast and keep `connection_id`/`request_id` out of metric
+labels. Hosts still own redaction of their session `meta` and existing request
+paths. No timing policy changes for SSE, WebSockets or slow downloads.
+
 ## Deviations from Agent Vault
 
 This proxy replaced Infisical's Agent Vault behind the same interface. The

@@ -115,8 +115,8 @@ defmodule Managoat.Broker.Proxy do
 
   Three bound a connection, and one bounds a request. `@head_timeout` (30s)
   is how long the proxy waits for a client to begin a request;
-  `@idle_timeout` (300s) is the gap it allows between reads, on the way in
-  and on the way back; `@connect_timeout` (10s) is the upstream dial. All
+  `@idle_timeout` (300s) is the gap it allows between client reads and
+  plain HTTP origin reads; `@connect_timeout` (10s) is the upstream dial. All
   three are per operation, so none of them bounds a client that keeps
   sending — one byte at a time, forever.
 
@@ -142,6 +142,7 @@ defmodule Managoat.Broker.Proxy do
 
   alias Managoat.Broker.{
     Certs,
+    Diagnostics,
     HTTP,
     HTTPOnly,
     Injector,
@@ -221,7 +222,8 @@ defmodule Managoat.Broker.Proxy do
       upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
       max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
       max_response_bytes: Keyword.get(opts, :max_response_bytes, :infinity),
-      request_read_timeout: Keyword.get(opts, :request_read_timeout, @request_read_timeout)
+      request_read_timeout: Keyword.get(opts, :request_read_timeout, @request_read_timeout),
+      diagnostics_interval: Keyword.get(opts, :diagnostics_interval)
     }
 
     serve_client(socket, "", state, @auth_attempts)
@@ -444,10 +446,23 @@ defmodule Managoat.Broker.Proxy do
   # CONNECT: a TLS tunnel the proxy terminates on both ends
 
   defp tunnel(socket, host, port, session, state) do
+    trace =
+      Diagnostics.start(state.diagnostics_interval, %{host: host, port: port, meta: session.meta})
+
+    result = traced_tunnel(socket, host, port, session, state, trace)
+    Diagnostics.stop(trace, :handler_done)
+    result
+  end
+
+  defp traced_tunnel(socket, host, port, session, state, trace) do
     state = Map.put(state, :protected_tls, ProtectedRule.destination?(session, host, port))
 
-    with {:ok, addresses} <- resolve(socket, host, port, state),
-         {:ok, upstream} <- connect_tls(socket, addresses, host, port, state) do
+    with {:ok, addresses} <-
+           Diagnostics.measure(trace, :dns, fn -> resolve(socket, host, port, state) end),
+         {:ok, upstream} <-
+           Diagnostics.measure(trace, :upstream_connect, fn ->
+             connect_tls(socket, addresses, host, port, state)
+           end) do
       Socket.send(socket, "HTTP/1.1 200 Connection established\r\n\r\n")
       connect_event(session, host, port, :ok)
 
@@ -456,7 +471,9 @@ defmodule Managoat.Broker.Proxy do
       # ours. (`Socket.upgrade` does not compose with a synchronous handler.)
       # Closing the TLS socket closes the TCP one under it, and the
       # handler's own close afterwards is a no-op on a closed port.
-      case :ssl.handshake(socket.socket, client_ssl_options(state.certs, host), @head_timeout) do
+      case Diagnostics.measure(trace, :client_tls, fn ->
+             :ssl.handshake(socket.socket, client_ssl_options(state.certs, host), @head_timeout)
+           end) do
         {:ok, client} ->
           # The relay owns the upstream socket's inbound side, so it can
           # wait on origin bytes and on the descriptors `serve/6` sends it
@@ -469,7 +486,8 @@ defmodule Managoat.Broker.Proxy do
                 upstream,
                 client,
                 Response.new(state.max_response_bytes),
-                HTTPOnly.new(session.http_only)
+                HTTPOnly.new(session.http_only),
+                trace
               )
             end)
 
@@ -486,6 +504,7 @@ defmodule Managoat.Broker.Proxy do
             session: session,
             store: state.store,
             relay: relay,
+            diagnostics: trace,
             max_request_bytes: state.max_request_bytes,
             request_read_timeout: state.request_read_timeout
           }
@@ -686,7 +705,7 @@ defmodule Managoat.Broker.Proxy do
   # `receive` serve both origin bytes and the descriptors `serve/7` sends.
   # HTTP-only sessions gate bounded response heads before the write; their
   # bodies still stream. Other sessions retain the observer-only relay.
-  defp relay(upstream, client, framer, gate) do
+  defp relay(upstream, client, framer, gate, trace) do
     receive do
       # `secrets` is what this request's response is searched for: the
       # bearer of a protected request, and nil for every other. It rides
@@ -697,7 +716,8 @@ defmodule Managoat.Broker.Proxy do
           upstream,
           client,
           Response.expect(framer, request),
-          HTTPOnly.expect(gate, request.method, ReflectionGuard.new(secrets))
+          HTTPOnly.expect(gate, request.method, ReflectionGuard.new(secrets)),
+          trace
         )
 
       # A refusal the handler made itself, to be written only where it
@@ -712,14 +732,15 @@ defmodule Managoat.Broker.Proxy do
           send(from, {ref, :busy})
         end
 
-        relay(upstream, client, framer, gate)
+        relay(upstream, client, framer, gate, trace)
 
       {:ssl, ^upstream, data} ->
+        Diagnostics.received(trace, byte_size(data))
         :ssl.setopts(upstream, active: :once)
 
         case HTTPOnly.filter(gate, data) do
           {:ok, gate, safe} ->
-            case :ssl.send(client, safe) do
+            case Diagnostics.write(trace, byte_size(safe), fn -> :ssl.send(client, safe) end) do
               :ok ->
                 {framer, finished} = Response.observe(framer, safe)
                 Enum.each(finished, &emit_finished/1)
@@ -728,7 +749,7 @@ defmodule Managoat.Broker.Proxy do
                   :ssl.close(client)
                   :ok
                 else
-                  relay(upstream, client, framer, gate)
+                  relay(upstream, client, framer, gate, trace)
                 end
 
               {:error, _} ->
@@ -745,7 +766,8 @@ defmodule Managoat.Broker.Proxy do
         # What a reflection guard was holding back belongs to a body that
         # only this close ends. It was never the bearer, or it would not
         # have been held.
-        _ = client_tls_send(client, HTTPOnly.closed(gate))
+        tail = HTTPOnly.closed(gate)
+        _ = Diagnostics.write(trace, byte_size(tail), fn -> client_tls_send(client, tail) end)
         :ssl.close(client)
         finish_relay(framer, &Response.closed/1)
 
@@ -898,7 +920,11 @@ defmodule Managoat.Broker.Proxy do
         # `head` is the target the client sent; `target` is the one to
         # forward. Telemetry is derived from the former, so a substituted
         # credential is never what gets logged.
-        request = pending_request(conn.session, head, conn.host, {:ok, rule})
+        request =
+          Diagnostics.request(
+            conn.diagnostics,
+            pending_request(conn.session, head, conn.host, {:ok, rule})
+          )
 
         # Before the write, never after: an origin may answer faster than
         # the next line of code runs.
@@ -1649,6 +1675,8 @@ defmodule Managoat.Broker.Proxy do
   # monotonic `duration` in native units beside `count` — a host converts
   # it to whatever unit it stores.
   defp emit(request, status, error) do
+    Diagnostics.finished(request)
+
     :telemetry.execute(
       [:managoat, :broker, :request],
       %{count: 1, duration: System.monotonic_time() - request.started_at},
@@ -1663,6 +1691,7 @@ defmodule Managoat.Broker.Proxy do
         error: error,
         meta: request.meta
       }
+      |> Map.merge(Map.take(request, [:connection_id, :request_id]))
     )
   end
 
