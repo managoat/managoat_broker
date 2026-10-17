@@ -703,6 +703,10 @@ or from the protocol; it cannot be measured.
   Varying non-credential headers also costs reuse; this is deliberately
   conservative and should be measured against package-manager traffic.
 
+  DNS is resolved and every answer vetted again on each request. Reordered
+  answers retain the selected address while it remains in the vetted set;
+  a removed address or changed pool identity retires the connection.
+
   Pool and connection idle lifetimes are 15 seconds. Changing the key or
   closing the client retires its pool. HTTP/2 is disabled because Finch's
   HTTP/2 streaming does not provide the required backpressure. No redirects,
