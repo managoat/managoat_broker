@@ -8,6 +8,14 @@ include breaking changes and says so; patch releases are always safe to take.
 Merging a version bump to `main` publishes it to hex; a PR that changes what
 the package ships without a bump fails the release gate.
 
+## [0.19.1]
+
+- Preserve a download's pooled origin connection when DNS reorders the same
+  vetted addresses. Resolve and vet every answer on every request, retaining
+  the selected address only while it remains present and the hostname, port,
+  session and headers still match. Removed addresses retire the pool; failed
+  connections retain the existing pre-send fallback to other vetted addresses.
+
 ## [0.19.0]
 
 - Reuse upstream HTTP/1 connections for bodyless absolute-form GET/HEAD

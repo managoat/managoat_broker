@@ -19,7 +19,7 @@ defmodule Managoat.Broker.PlainHTTP do
   def close(client) do
     case Process.delete(@key) do
       nil -> :ok
-      pool -> Finch.stop_pool(client, pool)
+      {pool, _address} -> Finch.stop_pool(client, pool)
     end
   end
 
@@ -94,19 +94,23 @@ defmodule Managoat.Broker.PlainHTTP do
          state,
          {pending, emit}
        ) do
-    address = hd(addresses) |> :inet.ntoa() |> to_string()
-    authority = if tuple_size(hd(addresses)) == 8, do: "[#{address}]", else: address
-    url = "http://#{authority}:#{port}/"
-
     tag =
       {self(),
        :crypto.hash(:sha256, :erlang.term_to_binary({host, session, head.headers, headers}))}
 
+    # DNS is resolved and the complete answer set vetted before this call.
+    # Prefer the previous address only while it is still eligible for this
+    # exact pool identity; resolver ordering must not discard a live socket.
+    addresses = prefer_previous(addresses, tag, port)
+    selected = hd(addresses)
+    address = selected |> :inet.ntoa() |> to_string()
+    authority = if tuple_size(selected) == 8, do: "[#{address}]", else: address
+    url = "http://#{authority}:#{port}/"
     pool = Finch.Pool.new(url, tag: tag)
 
-    if Process.get(@key) != pool do
+    if Process.get(@key) != {pool, selected} do
       close(state.http_client)
-      Process.put(@key, pool)
+      Process.put(@key, {pool, selected})
     end
 
     # Keep the exact target, including escaping and query bytes. Only the
@@ -157,6 +161,16 @@ defmodule Managoat.Broker.PlainHTTP do
 
       _ ->
         finish_result(result)
+    end
+  end
+
+  defp prefer_previous(addresses, tag, port) do
+    case Process.get(@key) do
+      {%Finch.Pool{scheme: :http, port: ^port, tag: ^tag}, address} ->
+        if address in addresses, do: [address | List.delete(addresses, address)], else: addresses
+
+      _ ->
+        addresses
     end
   end
 
