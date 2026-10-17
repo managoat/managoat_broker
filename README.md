@@ -87,6 +87,14 @@ Two guards protect the operator's network and the tenant's intent:
   refuses a request no rule matches inside a tunnel with `403`. That is how
   an allowlist is enforced: one `:passthrough` rule per allowed host.
 
+HTTP Host is generated from the authorized destination **after injection**,
+for absolute-form requests and ordinary requests inside CONNECT. A client or
+credential template cannot route injected headers to another virtual host on
+the vetted address. Inside CONNECT, request targets must be origin-form paths
+(or `OPTIONS *`); inner absolute URIs and nested CONNECT targets are refused.
+This also applies after target substitution. WebSocket upgrades and streaming
+requests with ordinary paths retain their existing behavior.
+
 ## The `Store` behaviour
 
 ```elixir

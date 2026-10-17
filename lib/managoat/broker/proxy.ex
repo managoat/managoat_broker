@@ -1125,16 +1125,6 @@ defmodule Managoat.Broker.Proxy do
          {:ok, headers, target, rule} <-
            inject_or_deny(socket, head, {host, port, target}, session, state.store),
          {:ok, addresses} <- resolve(socket, host, port, state) do
-      # RFC 9112 absolute-form authority controls Host. Neither the sandbox
-      # nor a credential template may route injected headers to another
-      # virtual host on the vetted address.
-      authority = if String.contains?(host, ":"), do: "[#{host}]", else: host
-      authority = if port == 80, do: authority, else: "#{authority}:#{port}"
-
-      headers = [
-        {"host", authority} | Enum.reject(headers, &(String.downcase(elem(&1, 0)) == "host"))
-      ]
-
       if PlainHTTP.eligible?(head, headers) do
         pending = pending_request(session, head, host, {:ok, rule})
 
@@ -1285,7 +1275,8 @@ defmodule Managoat.Broker.Proxy do
   # Keep the admitted rules local to this request. In particular, never
   # replace conn.session: every later request must use the original pin.
   defp authorize_and_inject(store, session, request, headers) do
-    with :ok <- HTTPOnly.check_request(session.http_only, request.method, headers) do
+    with :ok <- origin_form(request.method, request.target),
+         :ok <- HTTPOnly.check_request(session.http_only, request.method, headers) do
       case ProtectedRule.select(session, request) do
         :ordinary ->
           ordinary_inject(store, session, request, headers)
@@ -1308,9 +1299,26 @@ defmodule Managoat.Broker.Proxy do
            Injector.inject(headers, request.host, request.port, request.target, admitted),
          :ok <- HTTPOnly.check_request(session.http_only, request.method, outgoing),
          :ok <- HTTPOnly.check_framing(session.http_only, headers, outgoing) do
-      {:ok, outgoing, target, rule}
+      with :ok <- origin_form(request.method, target) do
+        {:ok, authoritative_host(outgoing, request), target, rule}
+      end
     end
   end
+
+  # The destination we authorized controls virtual-host routing too. This
+  # applies after injection, so a template cannot replace the authority.
+  defp authoritative_host(headers, request) do
+    host = if String.contains?(request.host, ":"), do: "[#{request.host}]", else: request.host
+    default = if request.scheme == :https, do: 443, else: 80
+    authority = if request.port == default, do: host, else: "#{host}:#{request.port}"
+    [{"host", authority} | Enum.reject(headers, &(String.downcase(elem(&1, 0)) == "host"))]
+  end
+
+  # An absolute URI inside CONNECT can override Host at the origin. Require
+  # origin-form (or OPTIONS *) both before and after target substitution.
+  defp origin_form(_method, "/" <> _), do: :ok
+  defp origin_form("OPTIONS", "*"), do: :ok
+  defp origin_form(_method, _target), do: {:error, :unsafe_request}
 
   defp connect_plain(socket, addresses, host, port) do
     dial = fn address ->

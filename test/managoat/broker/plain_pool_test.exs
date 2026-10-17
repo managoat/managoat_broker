@@ -167,4 +167,62 @@ defmodule Managoat.Broker.PlainPoolTest do
       assert body["headers"]["x-token"] == "fixture-secret"
     end
   end
+
+  for http_only <- [false, true] do
+    test "CONNECT binds Host after injection with HTTP-only #{http_only}", ctx do
+      rules = [
+        %Rule{
+          pattern: "localhost",
+          scheme: :custom,
+          template: %{"Host" => "wrong-template.example", "X-Token" => "{{ TOKEN }}"},
+          credential: %{"TOKEN" => "fixture-secret"}
+        }
+      ]
+
+      token = put_session(ctx, %{session() | rules: rules, http_only: unquote(http_only)})
+      tls = tunnel(ctx, token)
+
+      {_, body} =
+        Managoat.Broker.ProxyCase.request(
+          tls,
+          "GET /host HTTP/1.1\r\nHost: wrong-sandbox.example\r\n\r\n"
+        )
+
+      assert body["headers"]["host"] == "localhost:#{ctx.https_port}"
+      assert body["headers"]["x-token"] == "fixture-secret"
+      :ssl.close(tls)
+    end
+
+    test "CONNECT refuses an inner absolute authority with HTTP-only #{http_only}", ctx do
+      token = put_session(ctx, %{session() | http_only: unquote(http_only)})
+      tls = tunnel(ctx, token)
+      :ssl.send(tls, "GET https://other.example/private HTTP/1.1\r\nHost: localhost\r\n\r\n")
+      assert recv_until(tls, "\r\n\r\n") =~ "403 Forbidden"
+      :ssl.close(tls)
+    end
+  end
+
+  test "CONNECT permits OPTIONS * but refuses substitution to an absolute URI", ctx do
+    token = put_session(ctx, session())
+    tls = tunnel(ctx, token)
+
+    {head, _} =
+      Managoat.Broker.ProxyCase.request(tls, "OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n")
+
+    assert head =~ "200"
+    :ssl.close(tls)
+
+    rule = %Rule{
+      pattern: "localhost",
+      scheme: :substitute,
+      placeholder: "/__target__",
+      credential: "https://other.example/private"
+    }
+
+    token = put_session(ctx, %{session() | rules: [rule]})
+    tls = tunnel(ctx, token)
+    :ssl.send(tls, "GET /__target__ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert recv_until(tls, "\r\n\r\n") =~ "403 Forbidden"
+    :ssl.close(tls)
+  end
 end

@@ -16,9 +16,12 @@ the package ships without a bump fails the release gate.
   CONNECT on their existing paths; preserve vetted-IP dialing and dual-stack
   connection fallback. Download responses use strict framing and streamed
   body/trailer forwarding.
-- Bind outgoing plain-HTTP Host to its absolute target authority, so sandbox
+- Bind outgoing Host to its authorized destination authority, for plain HTTP
+  and ordinary CONNECT requests, so sandbox
   headers and credential templates cannot redirect injected headers to another
-  virtual host on the same vetted IP.
+  virtual host on the same vetted IP. Inner requests require origin-form
+  targets (or OPTIONS *) before and after substitution; absolute-form and
+  nested CONNECT targets are refused instead of bypassing that authority.
 
 
 ## [0.18.0]
