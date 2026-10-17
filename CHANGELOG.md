@@ -16,6 +16,9 @@ the package ships without a bump fails the release gate.
   CONNECT on their existing paths; preserve vetted-IP dialing and dual-stack
   connection fallback. Download responses use strict framing and streamed
   body/trailer forwarding.
+- Bind outgoing plain-HTTP Host to its absolute target authority, so sandbox
+  headers and credential templates cannot redirect injected headers to another
+  virtual host on the same vetted IP.
 
 
 ## [0.18.0]

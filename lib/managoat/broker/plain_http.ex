@@ -110,8 +110,8 @@ defmodule Managoat.Broker.PlainHTTP do
     end
 
     # Keep the exact target, including escaping and query bytes. Only the
-    # vetted address goes to the transport; Host remains the sandbox's
-    # original value after injection, as on the legacy path.
+    # vetted address goes to the transport; the proxy already normalized
+    # Host to the absolute target authority after injection.
     request =
       Finch.build(head.method, url, Enum.reject(headers, &hop_header?/1), nil, pool_tag: tag)
 

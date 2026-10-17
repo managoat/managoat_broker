@@ -700,7 +700,8 @@ or from the protocol; it cannot be measured.
   HTTP/2 streaming does not provide the required backpressure. No redirects,
   automatic decompression, or request retries are enabled. Only a failed
   **connect before sending** tries another already-vetted address. The
-  transport dials the vetted IP literal, preserving the original Host header.
+  transport dials the vetted IP literal, setting Host from the absolute target authority after injection. A sandbox
+  header or credential template cannot select another virtual host.
 
   Finch decodes transfer framing, which the proxy emits again; body bytes
   remain unchanged. Headers are normalized and informational responses lose

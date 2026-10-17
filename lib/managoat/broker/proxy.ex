@@ -1125,6 +1125,16 @@ defmodule Managoat.Broker.Proxy do
          {:ok, headers, target, rule} <-
            inject_or_deny(socket, head, {host, port, target}, session, state.store),
          {:ok, addresses} <- resolve(socket, host, port, state) do
+      # RFC 9112 absolute-form authority controls Host. Neither the sandbox
+      # nor a credential template may route injected headers to another
+      # virtual host on the vetted address.
+      authority = if String.contains?(host, ":"), do: "[#{host}]", else: host
+      authority = if port == 80, do: authority, else: "#{authority}:#{port}"
+
+      headers = [
+        {"host", authority} | Enum.reject(headers, &(String.downcase(elem(&1, 0)) == "host"))
+      ]
+
       if PlainHTTP.eligible?(head, headers) do
         pending = pending_request(session, head, host, {:ok, rule})
 

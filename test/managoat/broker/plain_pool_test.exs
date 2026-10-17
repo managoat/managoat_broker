@@ -143,4 +143,28 @@ defmodule Managoat.Broker.PlainPoolTest do
 
     assert read_until_closed(ctx.tcp) =~ "502"
   end
+
+  for method <- ["GET", "POST"] do
+    test "#{method} binds Host to absolute authority after sandbox and template headers", ctx do
+      rules = [
+        %Rule{
+          pattern: "localhost",
+          scheme: :custom,
+          template: %{"Host" => "wrong-template.example", "X-Token" => "{{ TOKEN }}"},
+          credential: %{"TOKEN" => "fixture-secret"}
+        }
+      ]
+
+      token = put_session(ctx, %{session() | rules: rules})
+
+      :gen_tcp.send(
+        ctx.tcp,
+        "#{unquote(method)} http://localhost:#{ctx.http_port}/host HTTP/1.1\r\nHost: wrong-sandbox.example\r\nProxy-Authorization: #{proxy_auth(token)}\r\n\r\n"
+      )
+
+      {_, body} = read_plain_json(ctx.tcp)
+      assert body["headers"]["host"] == "localhost:#{ctx.http_port}"
+      assert body["headers"]["x-token"] == "fixture-secret"
+    end
+  end
 end
