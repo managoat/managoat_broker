@@ -88,7 +88,10 @@ defmodule Managoat.Broker.HTTPOnly do
   """
   @spec idle?(t() | nil) :: boolean()
   def idle?(nil), do: true
-  def idle?(%__MODULE__{pending: [], body: nil, buffer: ""}), do: true
+
+  def idle?(%__MODULE__{pending: [], body: body, buffer: ""})
+      when body in [nil, :none, {:length, 0}], do: true
+
   def idle?(%__MODULE__{}), do: false
 
   @doc """

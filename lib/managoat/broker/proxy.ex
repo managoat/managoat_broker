@@ -18,17 +18,14 @@ defmodule Managoat.Broker.Proxy do
   another, and each one is authenticated, validated, matched against the
   session's rules and given its own read deadline again, so the second
   request on a connection is decided exactly as the first was. The two
-  hops' lifetimes are decided separately, which is what a proxy is
-  supposed to do with a hop-by-hop header: the *origin* connection is this
-  request's alone — dialed fresh, asked to close, closed after the
-  response — so there is no pooled socket to be caught being closed
-  underneath a request whose body has already been streamed away and
-  cannot be sent again. The response head is re-emitted with this hop's
-  own `Connection` rather than the origin's, which is the one place a
-  response is not relayed byte for byte; its body still is. A connection
-  ends after one request when the client asked it to, when it speaks
-  HTTP/1.0, when the response ends only at the origin's close, or on any
-  refusal.
+  hops' lifetimes are decided separately. Bodyless GET/HEAD requests use
+  Finch's HTTP/1 transport with one size-one pool per client connection,
+  retained only while origin, session and headers match. Idle connections
+  expire after 15 seconds. Other methods and requests carrying bodies
+  retain the streaming, one-origin-connection-per-request path. Requests
+  are never replayed after sending begins. The response head is re-emitted
+  for this hop; Finch also decodes and re-encodes chunk framing on its path.
+  Bodies stream with synchronous downstream writes providing backpressure.
 
   On `CONNECT` the proxy opens the upstream TLS connection first (a host it
   cannot reach is a `502` before the tunnel exists), answers `200`, then
@@ -107,9 +104,8 @@ defmodule Managoat.Broker.Proxy do
   and `port` are nil and `meta` is empty.
 
   It counts *origin* connections, not sandbox ones. A `CONNECT` tunnel is
-  one of each, but an absolute-form connection carrying three requests
-  dials three times and emits three, since each request is its own
-  decision about its own origin.
+  one of each. Eligible absolute-form downloads can share an origin
+  connection: a reused connection emits no additional connect event.
 
   ## Timeouts
 
@@ -147,6 +143,7 @@ defmodule Managoat.Broker.Proxy do
     HTTPOnly,
     Injector,
     ProtectedRule,
+    PlainHTTP,
     ReflectionGuard,
     Response,
     Rule,
@@ -217,6 +214,7 @@ defmodule Managoat.Broker.Proxy do
   def handle_connection(socket, opts) do
     state = %{
       store: Keyword.fetch!(opts, :store),
+      http_client: Keyword.fetch!(opts, :http_client),
       certs: Keyword.fetch!(opts, :certs),
       allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, false),
       upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
@@ -226,7 +224,11 @@ defmodule Managoat.Broker.Proxy do
       diagnostics_interval: Keyword.get(opts, :diagnostics_interval)
     }
 
-    serve_client(socket, "", state, @auth_attempts)
+    try do
+      serve_client(socket, "", state, @auth_attempts)
+    after
+      PlainHTTP.close(state.http_client)
+    end
   end
 
   # One request head off this connection, and what the proxy does about it.
@@ -1122,8 +1124,57 @@ defmodule Managoat.Broker.Proxy do
     with false <- oversized_plain(socket, session, head, host, framing, state),
          {:ok, headers, target, rule} <-
            inject_or_deny(socket, head, {host, port, target}, session, state.store),
-         {:ok, addresses} <- resolve(socket, host, port, state),
-         {:ok, upstream} <- connect_plain(socket, addresses, host, port) do
+         {:ok, addresses} <- resolve(socket, host, port, state) do
+      if PlainHTTP.eligible?(head, headers) do
+        pending = pending_request(session, head, host, {:ok, rule})
+
+        result =
+          PlainHTTP.request(
+            socket,
+            {head, headers, target},
+            {host, port, addresses},
+            session,
+            state,
+            {pending, &emit_finished/1}
+          )
+
+        case result do
+          :keep_alive -> {:keep_alive, rest}
+          :close -> {:close, state}
+        end
+      else
+        PlainHTTP.close(state.http_client)
+
+        forward_plain_unpooled(
+          socket,
+          {head, headers, target, rest, deadline, rule},
+          {host, port, addresses},
+          session,
+          state
+        )
+      end
+    else
+      true ->
+        {:close, state}
+
+      {:error, reason} when reason in [:denied, :private_upstream] ->
+        connect_event(session, host, port, :denied)
+        {:close, state}
+
+      {:error, _} ->
+        connect_event(session, host, port, :upstream_failed)
+        {:close, state}
+    end
+  end
+
+  defp forward_plain_unpooled(
+         socket,
+         {head, headers, target, rest, deadline, rule},
+         {host, port, addresses},
+         session,
+         state
+       ) do
+    with {:ok, upstream} <- connect_plain(socket, addresses, host, port) do
       connect_event(session, host, port, :ok)
 
       plain = %{
@@ -1144,13 +1195,6 @@ defmodule Managoat.Broker.Proxy do
       :gen_tcp.close(upstream)
       outcome_of(outcome, state)
     else
-      true ->
-        {:close, state}
-
-      {:error, reason} when reason in [:denied, :private_upstream] ->
-        connect_event(session, host, port, :denied)
-        {:close, state}
-
       {:error, _} ->
         connect_event(session, host, port, :upstream_failed)
         {:close, state}
@@ -1231,7 +1275,8 @@ defmodule Managoat.Broker.Proxy do
   # Keep the admitted rules local to this request. In particular, never
   # replace conn.session: every later request must use the original pin.
   defp authorize_and_inject(store, session, request, headers) do
-    with :ok <- HTTPOnly.check_request(session.http_only, request.method, headers) do
+    with :ok <- origin_form(request.method, request.target),
+         :ok <- HTTPOnly.check_request(session.http_only, request.method, headers) do
       case ProtectedRule.select(session, request) do
         :ordinary ->
           ordinary_inject(store, session, request, headers)
@@ -1254,9 +1299,26 @@ defmodule Managoat.Broker.Proxy do
            Injector.inject(headers, request.host, request.port, request.target, admitted),
          :ok <- HTTPOnly.check_request(session.http_only, request.method, outgoing),
          :ok <- HTTPOnly.check_framing(session.http_only, headers, outgoing) do
-      {:ok, outgoing, target, rule}
+      with :ok <- origin_form(request.method, target) do
+        {:ok, authoritative_host(outgoing, request), target, rule}
+      end
     end
   end
+
+  # The destination we authorized controls virtual-host routing too. This
+  # applies after injection, so a template cannot replace the authority.
+  defp authoritative_host(headers, request) do
+    host = if String.contains?(request.host, ":"), do: "[#{request.host}]", else: request.host
+    default = if request.scheme == :https, do: 443, else: 80
+    authority = if request.port == default, do: host, else: "#{host}:#{request.port}"
+    [{"host", authority} | Enum.reject(headers, &(String.downcase(elem(&1, 0)) == "host"))]
+  end
+
+  # An absolute URI inside CONNECT can override Host at the origin. Require
+  # origin-form (or OPTIONS *) both before and after target substitution.
+  defp origin_form(_method, "/" <> _), do: :ok
+  defp origin_form("OPTIONS", "*"), do: :ok
+  defp origin_form(_method, _target), do: {:error, :unsafe_request}
 
   defp connect_plain(socket, addresses, host, port) do
     dial = fn address ->

@@ -114,6 +114,7 @@ defmodule Managoat.Broker do
                [
                  store: Keyword.fetch!(opts, :store),
                  certs: certs,
+                 http_client: Module.concat(name, HTTPClient),
                  allow_private_upstreams: Keyword.get(opts, :allow_private_upstreams, false),
                  upstream_ssl_options: Keyword.get(opts, :upstream_ssl_options, []),
                  max_request_bytes: Keyword.get(opts, :max_request_bytes, 1024 * 1024 * 1024),
@@ -126,7 +127,23 @@ defmodule Managoat.Broker do
       type: :supervisor
     }
 
-    Supervisor.init([listener], strategy: :one_for_one)
+    Managoat.Broker.PlainHTTP.attach_telemetry()
+
+    client =
+      {Finch,
+       name: Module.concat(name, HTTPClient),
+       pools: %{
+         :default => [
+           protocols: [:http1],
+           size: 1,
+           count: 1,
+           conn_max_idle_time: 15_000,
+           pool_max_idle_time: 15_000,
+           conn_opts: [transport_opts: [timeout: 10_000, inet6: true]]
+         ]
+       }}
+
+    Supervisor.init([client, listener], strategy: :one_for_one)
   end
 
   # `max_cached_leaves` is passed through rather than defaulted here: the

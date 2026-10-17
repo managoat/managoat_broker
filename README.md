@@ -43,8 +43,9 @@ ingress's job) speaking the two things a forward proxy speaks:
   tunnel is a byte pipe, unless the session opts into HTTP-only enforcement.
 - **Absolute-form requests** (`GET http://host/path`) for plain HTTP. The
   sandbox's connection is kept alive and may carry as many requests as it
-  likes, each decided afresh; the origin's connection is this request's
-  alone. The response head is the one thing not relayed byte for byte,
+  likes, each decided afresh. Bodyless GET/HEAD downloads reuse upstream
+  HTTP/1 connections through Finch; requests with bodies and other methods
+  retain the streaming path with a fresh origin connection. The response head is the one thing not relayed byte for byte,
   because `Connection` describes the hop it arrived on.
 
 Either form may name an IPv6 literal, bracketed: `CONNECT [::1]:8443` and
@@ -85,6 +86,14 @@ Two guards protect the operator's network and the tenant's intent:
   host no rule names at `CONNECT`, before a tunnel or handshake exists, and
   refuses a request no rule matches inside a tunnel with `403`. That is how
   an allowlist is enforced: one `:passthrough` rule per allowed host.
+
+HTTP Host is generated from the authorized destination **after injection**,
+for absolute-form requests and ordinary requests inside CONNECT. A client or
+credential template cannot route injected headers to another virtual host on
+the vetted address. Inside CONNECT, request targets must be origin-form paths
+(or `OPTIONS *`); inner absolute URIs and nested CONNECT targets are refused.
+This also applies after target substitution. WebSocket upgrades and streaming
+requests with ordinary paths retain their existing behavior.
 
 ## The `Store` behaviour
 
@@ -686,20 +695,33 @@ or from the protocol; it cannot be measured.
 
 ### Deliberate for now, with a condition attached
 
-- **One origin connection per absolute-form request, where Agent Vault
-  pooled them.** The sandbox's connection is kept alive and may carry as
-  many requests as it likes; the *origin* connection is dialed fresh for
-  each one, asked to close, and closed after the response. Agent Vault ran
-  its outbound requests through Go's `http.Transport`, which keeps a pool
-  keyed by host with a 90-second idle timeout.
+- **Conservative upstream reuse for absolute-form downloads.** Finch owns
+  HTTP/1 pooling and framing for bodyless GET/HEAD requests. There is one
+  size-one pool per client, isolated by original hostname, session and a
+  digest of incoming/effective headers. Different clients, tokens, rotated
+  credentials or changed headers cannot inherit connection-bound identity.
+  Varying non-credential headers also costs reuse; this is deliberately
+  conservative and should be measured against package-manager traffic.
 
-  A pool would save a handshake per request and cost the race that comes
-  with one: a pooled socket the origin closed while it was idle. The usual
-  answer is to redial and retry, and that answer is not available here —
-  the proxy streams a request body upstream rather than buffering it, so
-  there is nothing left to send again. Dialing per request is always
-  correct, and it is a local TCP handshake against traffic that is
-  package managers.
+  Pool and connection idle lifetimes are 15 seconds. Changing the key or
+  closing the client retires its pool. HTTP/2 is disabled because Finch's
+  HTTP/2 streaming does not provide the required backpressure. No redirects,
+  automatic decompression, or request retries are enabled. Only a failed
+  **connect before sending** tries another already-vetted address. The
+  transport dials the vetted IP literal, setting Host from the absolute target authority after injection. A sandbox
+  header or credential template cannot select another virtual host.
+
+  Finch decodes transfer framing, which the proxy emits again; body bytes
+  remain unchanged. Headers are normalized and informational responses lose
+  custom reason phrases. These downloads use strict response framing even
+  when the session did not request HTTP-only enforcement. Uploads, other
+  methods, and CONNECT retain their existing paths. Moving those paths is
+  separate work, not a claimed full transport replacement.
+
+  Broker events remain sanitized. Finch's own telemetry includes complete
+  request/response structures: do not log its metadata wholesale or export
+  headers/URLs that may contain credentials. The broker translates only its
+  connect events to its existing sanitized origin-connection events.
 
 - **Body caps are configurable, with Agent Vault's defaults.**
   `max_request_bytes` defaults to 1 GiB, matching Agent Vault's
