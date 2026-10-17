@@ -165,5 +165,38 @@ defmodule Managoat.Broker.HTTPOnlyFilterTest do
              ])
   end
 
+  test "protected body rejection is independent of socket packet boundaries" do
+    bearer = "fixture-bearer"
+    guard = Managoat.Broker.ReflectionGuard.new([bearer])
+
+    for suffix <- ["", "-more-body"] do
+      body = bearer <> suffix
+      head = "HTTP/1.1 200 OK\r\nContent-Length: #{byte_size(body)}\r\n\r\n"
+
+      for split <- 0..byte_size(bearer) do
+        state = true |> HTTPOnly.new() |> HTTPOnly.expect("GET", guard)
+        <<prefix::binary-size(split), rest::binary>> = bearer
+
+        if rest == "" do
+          assert {:error, :credential_reflected} = HTTPOnly.filter(state, head <> prefix)
+        else
+          assert {:ok, state, ^head} = HTTPOnly.filter(state, head <> prefix)
+          assert {:error, :credential_reflected} = HTTPOnly.filter(state, rest)
+        end
+      end
+    end
+  end
+
+  test "a response is not idle until its buffered head and body finish" do
+    state = gate("GET")
+    refute HTTPOnly.idle?(state)
+    assert {:ok, state, ""} = HTTPOnly.filter(state, "HTTP/1.1 200 OK\r\n")
+    refute HTTPOnly.idle?(state)
+    assert {:ok, state, _} = HTTPOnly.filter(state, "Content-Length: 2\r\n\r\no")
+    refute HTTPOnly.idle?(state)
+    assert {:ok, state, "k"} = HTTPOnly.filter(state, "k")
+    assert HTTPOnly.idle?(state)
+  end
+
   defp gate(method), do: true |> HTTPOnly.new() |> HTTPOnly.expect(method)
 end
