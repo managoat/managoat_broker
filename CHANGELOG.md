@@ -8,6 +8,16 @@ include breaking changes and says so; patch releases are always safe to take.
 Merging a version bump to `main` publishes it to hex; a PR that changes what
 the package ships without a bump fails the release gate.
 
+## [0.19.0]
+
+- Reuse upstream HTTP/1 connections for bodyless absolute-form GET/HEAD
+  downloads through Finch, with one bounded, isolated pool per client and
+  no replay after a request may have been sent. Keep streamed uploads and
+  CONNECT on their existing paths; preserve vetted-IP dialing and dual-stack
+  connection fallback. Download responses use strict framing and streamed
+  body/trailer forwarding.
+
+
 ## [0.18.0]
 
 - Allow stores to distinguish unavailable lookup authority from invalid tokens

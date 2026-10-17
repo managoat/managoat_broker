@@ -146,57 +146,63 @@ defmodule Managoat.Broker.HTTPOnlyTest do
     :ssl.close(tls)
   end
 
-  test "plain HTTP keeps alive and rejects upgrade on its next request", ctx do
-    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+  for method <- ["GET", "POST"] do
+    test "plain HTTP #{method} keeps alive and rejects upgrade on its next request", ctx do
+      {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
 
-    for _ <- 1..2 do
-      :gen_tcp.send(tcp, plain_request(ctx, ctx.http_port, ""))
-      {_, body} = read_plain_json(tcp)
-      assert body["headers"]["authorization"] == "Bearer managed-bearer"
+      for _ <- 1..2 do
+        :gen_tcp.send(tcp, plain_request(ctx, ctx.http_port, "", unquote(method)))
+        {_, body} = read_plain_json(tcp)
+        assert body["headers"]["authorization"] == "Bearer managed-bearer"
+      end
+
+      :gen_tcp.send(
+        tcp,
+        plain_request(ctx, ctx.http_port, "Upgrade: websocket\r\n", unquote(method))
+      )
+
+      assert read_until_closed(tcp) =~ "403 Forbidden"
     end
 
-    :gen_tcp.send(tcp, plain_request(ctx, ctx.http_port, "Upgrade: websocket\r\n"))
-    assert read_until_closed(tcp) =~ "403 Forbidden"
-  end
+    test "plain HTTP #{method} rejects an upstream 101 after an informational response", ctx do
+      {port, _} = raw_origin(ctx, :gen_tcp)
+      {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+      :gen_tcp.send(tcp, plain_request(ctx, port, "", unquote(method)))
+      assert_receive {:origin_request, origin, _}, 2_000
 
-  test "plain HTTP rejects an upstream 101 after an informational response", ctx do
-    {port, _} = raw_origin(ctx, :gen_tcp)
-    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
-    :gen_tcp.send(tcp, plain_request(ctx, port, ""))
-    assert_receive {:origin_request, origin, _}, 2_000
+      send(
+        origin,
+        {:reply, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 101 Switching Protocols\r\n\r\nframes"}
+      )
 
-    send(
-      origin,
-      {:reply, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 101 Switching Protocols\r\n\r\nframes"}
-    )
+      wire = read_until_closed(tcp)
+      assert wire == "HTTP/1.1 100 Continue\r\n\r\n"
+      assert_receive {:request, _, %{status: nil, error: :upstream_upgrade}}
+    end
 
-    wire = read_until_closed(tcp)
-    assert wire == "HTTP/1.1 100 Continue\r\n\r\n"
-    assert_receive {:request, _, %{status: nil, error: :upstream_upgrade}}
-  end
+    test "plain HTTP #{method} forwards informational and streamed responses correctly", ctx do
+      {port, _} = raw_origin(ctx, :gen_tcp)
+      {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
+      :gen_tcp.send(tcp, plain_request(ctx, port, "", unquote(method)))
+      assert_receive {:origin_request, origin, _}, 2_000
 
-  test "plain HTTP forwards informational and streamed responses correctly", ctx do
-    {port, _} = raw_origin(ctx, :gen_tcp)
-    {:ok, tcp} = :gen_tcp.connect(~c"127.0.0.1", ctx.proxy_port, [:binary, active: false])
-    :gen_tcp.send(tcp, plain_request(ctx, port, ""))
-    assert_receive {:origin_request, origin, _}, 2_000
+      send(
+        origin,
+        {:reply,
+         "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n"}
+      )
 
-    send(
-      origin,
-      {:reply,
-       "HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n"}
-    )
-
-    assert_receive {:origin_sent, ^origin}
-    {:ok, first} = :gen_tcp.recv(tcp, 0, 2_000)
-    assert first =~ "103"
-    # Continue only after the first bytes reached the client.
-    send(origin, {:reply, "3\r\ntwo\r\n0\r\n\r\n"})
-    wire = recv_plain_until(tcp, "0\r\n\r\n", first)
-    assert wire =~ "200 OK"
-    assert wire =~ "one"
-    assert wire =~ "two"
-    :gen_tcp.close(tcp)
+      assert_receive {:origin_sent, ^origin}
+      {:ok, first} = :gen_tcp.recv(tcp, 0, 2_000)
+      assert first =~ "103"
+      # Continue only after the first bytes reached the client.
+      send(origin, {:reply, "3\r\ntwo\r\n0\r\n\r\n"})
+      wire = recv_plain_until(tcp, "0\r\n\r\n", first)
+      assert wire =~ "200 OK"
+      assert wire =~ "one"
+      assert wire =~ "two"
+      :gen_tcp.close(tcp)
+    end
   end
 
   test "upgrade rejection and durable authorization both hold without invalidation messages" do
@@ -233,9 +239,9 @@ defmodule Managoat.Broker.HTTPOnlyTest do
     end
   end
 
-  defp plain_request(ctx, port, headers),
+  defp plain_request(ctx, port, headers, method),
     do:
-      "GET http://localhost:#{port}/echo HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: #{proxy_auth(ctx.token)}\r\n#{headers}\r\n"
+      "#{method} http://localhost:#{port}/echo HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: #{proxy_auth(ctx.token)}\r\n#{headers}\r\n"
 
   defp raw_origin(ctx, transport) do
     opts = [:binary, active: false, ip: {127, 0, 0, 1}, reuseaddr: true]
