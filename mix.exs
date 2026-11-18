@@ -65,7 +65,7 @@ defmodule Managoat.Broker.MixProject do
       # Pure Elixir over :public_key.
       {:x509, "~> 0.9"},
       {:telemetry, "~> 1.0"},
-      {:finch, "~> 0.23.0"},
+      {:finch, "~> 0.24.0"},
       # Test only: a real HTTPS origin behind the proxy, a WebSocket echo on
       # it, and JSON for what the origin echoes back. jason is :dev as well
       # because credo depends on it in :dev; with only :test here, Mix
